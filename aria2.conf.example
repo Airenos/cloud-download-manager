@@ -1,0 +1,19 @@
+# aria2 RPC template for the temporary download site.
+# start.sh writes the real runtime config to data/aria2.conf.
+# Do not put a real rpc-secret in this template.
+
+enable-rpc=true
+rpc-listen-all=false
+rpc-listen-port=6800
+rpc-listen-address=127.0.0.1
+dir=./downloads
+continue=true
+file-allocation=none
+max-concurrent-downloads=2
+max-connection-per-server=4
+split=4
+auto-file-renaming=true
+allow-overwrite=false
+save-session=./data/aria2.session
+input-file=./data/aria2.session
+save-session-interval=60

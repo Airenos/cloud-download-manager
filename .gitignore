@@ -1,0 +1,17 @@
+downloads/*
+!downloads/.gitkeep
+
+logs/*
+!logs/.gitkeep
+
+data/*
+!data/.gitkeep
+
+data/admin_password.txt
+data/aria2_rpc_secret.txt
+data/filemeta.json
+data/aria2.conf
+aria2.session
+*.aria2
+__pycache__/
+*.py[cod]
