@@ -608,35 +608,107 @@ def page(title: str, body: str) -> bytes:
     p { margin: 6px 0; color: var(--muted); line-height: 1.55; }
     a { color: var(--primary-dark); text-decoration: none; }
     .actions, .row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .button, button, input[type=submit] { border: 0; border-radius: 8px; background: var(--primary); color: #fff; padding: 9px 13px; font-weight: 650; cursor: pointer; line-height: 1.2; }
+    .button, button, input[type=submit] { border: 0; border-radius: 8px; background: var(--primary); color: #fff; padding: 9px 13px; font-weight: 650; cursor: pointer; line-height: 1.2; transition: background .15s, transform .1s; font-size: inherit; }
+    .button:hover, button:hover, input[type=submit]:hover { background: var(--primary-dark); transform: translateY(-1px); }
+    .button:active, button:active, input[type=submit]:active { transform: translateY(0); }
     .button.secondary, button.secondary { background: #eef0ff; color: var(--primary-dark); }
+    .button.secondary:hover, button.secondary:hover { background: #e0e3ff; }
     button.danger { background: #ef4444; }
+    button.danger:hover { background: #dc2626; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 16px 0; }
-    .card, section, details { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
-    .card strong { display: block; font-size: 22px; margin-top: 6px; }
+    .card, section, details { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); transition: box-shadow .2s, transform .2s; }
+    .card:hover { box-shadow: 0 4px 12px rgba(109, 93, 252, 0.10); transform: translateY(-2px); }
+    .card strong { display: block; font-size: 22px; margin-top: 6px; color: var(--primary-dark); }
+    .card .card-label { font-size: 13px; color: var(--muted); }
     section, details { margin-top: 14px; }
-    summary { cursor: pointer; font-weight: 700; }
+    summary { cursor: pointer; font-weight: 700; padding: 2px 0; user-select: none; transition: color .15s; }
+    summary:hover { color: var(--primary); }
+    details[open] summary { margin-bottom: 10px; }
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 10px 8px; vertical-align: top; }
-    th { color: var(--muted); font-size: 13px; }
+    th { color: var(--muted); font-size: 13px; text-transform: none; }
+    tr:hover td { background: #fafaff; }
     .muted { color: var(--muted); }
     .notice { background: #fff; border-left: 4px solid var(--primary); padding: 12px 14px; border-radius: 8px; margin-top: 14px; }
-    .empty { padding: 16px; color: var(--muted); text-align: center; }
+    .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
     .progress { width: 110px; height: 8px; background: #eef0f6; border-radius: 999px; overflow: hidden; margin-top: 5px; }
-    .bar { height: 100%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); }
+    .bar { height: 100%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); transition: width .3s; }
     .viewer { background: #0f172a; border-radius: 8px; padding: 10px; }
     .viewer img, .viewer video { display: block; width: 100%; max-height: 72vh; object-fit: contain; border-radius: 6px; background: #0f172a; }
     form.inline { display: inline; }
-    label { display: block; font-weight: 650; margin: 10px 0 5px; }
-    input[type=text], input[type=password], input[type=url] { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; }
+    label { display: block; font-weight: 650; margin: 10px 0 5px; font-size: 14px; }
+    input[type=text], input[type=password], input[type=url] { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; transition: border-color .15s, box-shadow .15s; }
+    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
+    input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: #fafaff; transition: border-color .2s, background .2s; }
+    input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #f0edff; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .form-submit { margin-top: 14px; }
     .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    .upload-progress { display: none; margin-top: 12px; }
+    .upload-progress.active { display: block; }
+    .upload-bar-outer { width: 100%; height: 10px; background: #eef0f6; border-radius: 999px; overflow: hidden; }
+    .upload-bar-inner { height: 100%; width: 0%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); border-radius: 999px; transition: width .2s; }
+    .upload-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
+    .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 999; }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
     @media (max-width: 720px) { header, .form-grid { display: block; } .actions { margin-top: 12px; } th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) { display: none; } }
     """
     script = """
+    function showToast(msg) {
+      var el = document.getElementById('toast');
+      if (!el) { var d = document.createElement('div'); d.id='toast'; d.className='toast'; document.body.appendChild(d); el=d; }
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(el._t);
+      el._t = setTimeout(function(){ el.classList.remove('show'); }, 2000);
+    }
     function copyLink(path) {
-      const url = new URL(path, window.location.href).href;
-      navigator.clipboard.writeText(url).then(function(){ alert('链接已复制'); });
+      var url = new URL(path, window.location.href).href;
+      navigator.clipboard.writeText(url).then(function(){ showToast('\u94fe\u63a5\u5df2\u590d\u5236'); });
+    }
+    function handleUpload(form) {
+      var bar = document.getElementById('upload-bar');
+      var status = document.getElementById('upload-status');
+      var outer = document.getElementById('upload-progress');
+      var btn = form.querySelector('input[type=submit]');
+      var fd = new FormData(form);
+      var xhr = new XMLHttpRequest();
+      outer.classList.add('active');
+      btn.disabled = true;
+      btn.value = '\u4e0a\u4f20\u4e2d...';
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+          var pct = Math.round(e.loaded / e.total * 100);
+          bar.style.width = pct + '%';
+          var loaded = (e.loaded / 1048576).toFixed(1);
+          var total = (e.total / 1048576).toFixed(1);
+          status.textContent = pct + '% \u00b7 ' + loaded + ' / ' + total + ' MB';
+        }
+      };
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          bar.style.width = '100%';
+          status.textContent = '\u4e0a\u4f20\u5b8c\u6210\uff01\u6b63\u5728\u8df3\u8f6c...';
+          setTimeout(function(){ window.location.href = '/downloads/'; }, 800);
+        } else {
+          var msg = '\u4e0a\u4f20\u5931\u8d25';
+          try {
+            var m = xhr.responseText.match(/<p>([^<]+)<\\/p>/);
+            if (m) msg = m[1];
+          } catch(e) {}
+          status.textContent = msg;
+          btn.disabled = false;
+          btn.value = '\u91cd\u8bd5\u4e0a\u4f20';
+        }
+      };
+      xhr.onerror = function() {
+        status.textContent = '\u7f51\u7edc\u9519\u8bef\uff0c\u8bf7\u91cd\u8bd5';
+        btn.disabled = false;
+        btn.value = '\u91cd\u8bd5\u4e0a\u4f20';
+      };
+      xhr.open('POST', '/api/upload');
+      xhr.send(fd);
+      return false;
     }
     """
     html_doc = f"""<!doctype html>
@@ -783,7 +855,7 @@ def render_home(message: str = "") -> bytes:
 <details>
   <summary>上传本地文件</summary>
   <p>管理密码用于防止他人滥用上传功能，普通下载不需要密码。</p>
-  <form method="post" action="/api/upload" enctype="multipart/form-data">
+  <form method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="return handleUpload(this)">
     <label for="upload-file">选择文件</label>
     <input id="upload-file" name="file" type="file" required>
     <div class="form-grid">
@@ -797,7 +869,11 @@ def render_home(message: str = "") -> bytes:
       </div>
     </div>
     <p class="muted">文件名只允许中文、英文、数字、空格、点、下划线和短横线。单文件上限 {format_size(SINGLE_FILE_LIMIT_BYTES)}。</p>
-    <input type="submit" value="上传">
+    <div class="form-submit"><input type="submit" value="上传"></div>
+    <div id="upload-progress" class="upload-progress">
+      <div class="upload-bar-outer"><div id="upload-bar" class="upload-bar-inner"></div></div>
+      <div id="upload-status" class="upload-status"></div>
+    </div>
   </form>
 </details>
 <div class="notice">
