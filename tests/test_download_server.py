@@ -29,6 +29,43 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         os.environ.update(self.old_env)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def start_test_server(self):
+        server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        return server, thread, base
+
+    def multipart_upload_body(self, password="good-password", filename="upload.txt", content=b"hello"):
+        boundary = "----codex-upload-boundary"
+        parts = [
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="password"\r\n\r\n'
+                f"{password}\r\n"
+            ).encode("utf-8"),
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n"
+            ).encode("utf-8")
+            + content
+            + b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+        body = b"".join(parts)
+        return body, f"multipart/form-data; boundary={boundary}"
+
+    def post_upload(self, base, password="good-password", filename="upload.txt", content=b"hello"):
+        body, content_type = self.multipart_upload_body(password, filename, content)
+        request = urllib.request.Request(
+            f"{base}/api/upload",
+            data=body,
+            headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+            method="POST",
+        )
+        return urllib.request.urlopen(request, timeout=3)
+
     def test_custom_filename_validation_accepts_allowed_characters(self):
         name = "中文 File_01-测试.txt"
         self.assertEqual(self.ds.validate_custom_filename(name), name)
@@ -228,6 +265,61 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertEqual(status, 206)
             self.assertEqual(body, b"2345")
             self.assertEqual(content_range, "bytes 2-5/10")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_upload_requires_admin_password(self):
+        server, thread, base = self.start_test_server()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_upload(base, password="wrong", filename="secret.txt", content=b"nope")
+            self.assertEqual(error.exception.code, 403)
+            self.assertFalse((self.ds.DOWNLOADS_DIR / "secret.txt").exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_upload_rejects_invalid_filename(self):
+        password = self.ds.get_admin_password()
+        server, thread, base = self.start_test_server()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_upload(base, password=password, filename="../evil.txt", content=b"bad")
+            self.assertEqual(error.exception.code, 400)
+            self.assertFalse((self.ds.DOWNLOADS_DIR / "evil.txt").exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_upload_saves_file_and_meta(self):
+        password = self.ds.get_admin_password()
+        server, thread, base = self.start_test_server()
+        try:
+            with self.post_upload(base, password=password, filename="photo.jpg", content=b"image-data") as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("photo.jpg", body)
+            self.assertEqual((self.ds.DOWNLOADS_DIR / "photo.jpg").read_bytes(), b"image-data")
+            self.assertIn("photo.jpg", self.ds.load_meta())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_upload_rejects_existing_file_without_overwrite(self):
+        password = self.ds.get_admin_password()
+        existing = self.ds.DOWNLOADS_DIR / "same.txt"
+        existing.write_text("old", encoding="utf-8")
+        server, thread, base = self.start_test_server()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_upload(base, password=password, filename="same.txt", content=b"new")
+            self.assertEqual(error.exception.code, 409)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "old")
         finally:
             server.shutdown()
             server.server_close()

@@ -18,10 +18,15 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import warnings
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    import cgi
 
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", Path(__file__).resolve().parent)).resolve()
@@ -43,7 +48,7 @@ MAX_DOWNLOAD_DIR_BYTES = int(os.environ.get("MAX_DOWNLOAD_DIR_BYTES", str(12 * 1
 SINGLE_FILE_LIMIT_BYTES = int(os.environ.get("SINGLE_FILE_LIMIT_BYTES", str(4 * 1024**3)))
 TIMEZONE_CN = timezone(timedelta(hours=8))
 
-ALLOWED_URL_PREFIXES = ("http://", "https://", "magnet:?")
+ALLOWED_URL_PREFIXES = ("http://", "https://")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv", ".avi"}
 BANNED_PREFIXES = (
@@ -323,7 +328,7 @@ def check_admin_password(password: str) -> bool:
 def validate_task_url(url: str) -> str:
     value = (url or "").strip()
     if not value.startswith(ALLOWED_URL_PREFIXES):
-        raise ValueError("只允许 http://、https:// 或 magnet:? 链接")
+        raise ValueError("只允许 http:// 或 https:// 链接")
     parsed = urllib.parse.urlparse(value)
     if parsed.scheme in {"file", "ftp"}:
         raise ValueError("不允许 file:// 或 ftp:// 链接")
@@ -358,6 +363,51 @@ def ensure_can_add_task(url: str) -> None:
     remote_size = get_remote_content_length(url)
     if remote_size is not None and remote_size > SINGLE_FILE_LIMIT_BYTES:
         raise RuntimeError(f"远程文件超过单文件限制 {format_size(SINGLE_FILE_LIMIT_BYTES)}")
+
+
+def ensure_can_store_new_file() -> None:
+    stats = get_disk_stats()
+    free = int(stats["free"])
+    downloads_used = int(stats["downloads_used"])
+    if free < MIN_FREE_BYTES:
+        raise RuntimeError(f"系统剩余空间低于 {format_size(MIN_FREE_BYTES)}，已拒绝上传")
+    if downloads_used >= MAX_DOWNLOAD_DIR_BYTES:
+        raise RuntimeError(f"downloads 目录超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}，已拒绝上传")
+
+
+def save_uploaded_file(filename: str, source_file) -> int:
+    ensure_directories()
+    ensure_can_store_new_file()
+    name = validate_custom_filename(filename)
+    target = (DOWNLOADS_DIR / name).resolve()
+    target.relative_to(DOWNLOADS_DIR)
+    if target.exists():
+        raise FileExistsError("同名文件已存在，已拒绝覆盖")
+
+    tmp_path = DOWNLOADS_DIR / f".upload-{secrets.token_hex(8)}.tmp"
+    written = 0
+    try:
+        with tmp_path.open("wb") as out:
+            while True:
+                chunk = source_file.read(1024 * 128)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > SINGLE_FILE_LIMIT_BYTES:
+                    raise RuntimeError(f"上传文件超过单文件限制 {format_size(SINGLE_FILE_LIMIT_BYTES)}")
+                if get_downloads_usage() + written > MAX_DOWNLOAD_DIR_BYTES:
+                    raise RuntimeError(f"downloads 目录将超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}，已拒绝上传")
+                out.write(chunk)
+        tmp_path.replace(target)
+        meta = load_meta()
+        meta[name] = {"created_at": now_ts()}
+        save_meta(meta)
+        append_log("upload.log", f"uploaded name={name} size={written}")
+        return written
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        raise
 
 
 def aria2_rpc(method: str, params: list[object] | None = None) -> object:
@@ -440,10 +490,6 @@ def normalize_task(task: dict[str, object]) -> dict[str, object]:
     speed = int(task.get("downloadSpeed") or 0)
     progress = round((completed / total) * 100, 1) if total else 0.0
     hint = ""
-    if name.startswith("[METADATA]"):
-        hint = "正在获取磁力链接元数据。若 3-5 分钟无速度，可能是当前平台不支持 BT/DHT。"
-    elif total == 0 and speed == 0:
-        hint = "等待元数据"
     return {
         "gid": str(task.get("gid", "")),
         "name": name,
@@ -734,9 +780,28 @@ def render_home(message: str = "") -> bytes:
     <input type="submit" value="添加任务">
   </form>
 </details>
+<details>
+  <summary>上传本地文件</summary>
+  <p>管理密码用于防止他人滥用上传功能，普通下载不需要密码。</p>
+  <form method="post" action="/api/upload" enctype="multipart/form-data">
+    <label for="upload-file">选择文件</label>
+    <input id="upload-file" name="file" type="file" required>
+    <div class="form-grid">
+      <div>
+        <label for="upload-filename">自定义文件名（可选，留空使用原文件名）</label>
+        <input id="upload-filename" name="filename" type="text" maxlength="180">
+      </div>
+      <div>
+        <label for="upload-password">管理密码</label>
+        <input id="upload-password" name="password" type="password" required>
+      </div>
+    </div>
+    <p class="muted">文件名只允许中文、英文、数字、空格、点、下划线和短横线。单文件上限 {format_size(SINGLE_FILE_LIMIT_BYTES)}。</p>
+    <input type="submit" value="上传">
+  </form>
+</details>
 <div class="notice">
   <p>所有文件 {RETENTION_HOURS:g} 小时后自动删除；一次性下载在完整下载成功后自动删除。</p>
-  <p>magnet 为实验性支持，当前平台可能无法稳定获取元数据，推荐 HTTP/HTTPS 直链。</p>
   <p>仅用于合法资源临时中转。剩余空间低于 {format_size(MIN_FREE_BYTES)} 时会拒绝新任务。</p>
 </div>
 """
@@ -933,6 +998,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_error_page(403, "禁止访问")
             return
         raw_path = urllib.parse.urlsplit(self.path).path
+        if raw_path == "/api/upload":
+            self.handle_upload()
+            return
         form = parse_form(self)
         if raw_path == "/api/add-task":
             self.handle_add_task(form)
@@ -976,6 +1044,41 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_error_page(400, f"清理失败：{exc}")
             return
         self.send_bytes(200, success_page("已清理任务记录", f"清理数量：{count}"))
+
+    def handle_upload(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self.send_error_page(400, "请使用 multipart/form-data 表单上传")
+            return
+        try:
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
+            )
+        except Exception:
+            self.send_error_page(400, "表单解析失败")
+            return
+        password = form.getfirst("password", "")
+        if not check_admin_password(password):
+            self.send_error_page(403, "管理密码错误")
+            return
+        file_field = form["file"] if "file" in form else None
+        if file_field is None or not hasattr(file_field, "file") or not file_field.filename:
+            self.send_error_page(400, "请选择要上传的文件")
+            return
+        custom_name = (form.getfirst("filename", "") or "").strip()
+        filename = custom_name if custom_name else file_field.filename
+        try:
+            written = save_uploaded_file(filename, file_field.file)
+        except FileExistsError as exc:
+            self.send_error_page(409, str(exc))
+            return
+        except (ValueError, RuntimeError) as exc:
+            self.send_error_page(400, f"上传失败：{exc}")
+            return
+        safe_name = validate_custom_filename(filename)
+        self.send_bytes(200, success_page("上传成功", f"文件 {safe_name}（{format_size(written)}）已保存"))
 
     def handle_file(self, encoded_name: str, head_only: bool) -> None:
         try:
