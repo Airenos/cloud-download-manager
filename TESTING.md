@@ -1,6 +1,6 @@
 # 测试记录
 
-测试日期：2026-06-03
+测试日期：2026-06-04
 
 ## 当前本机环境
 
@@ -28,7 +28,7 @@ python -m unittest tests.test_download_server -v
 结果：
 
 ```text
-Ran 8 tests in 0.683s
+Ran 12 tests in 2.749s
 OK
 ```
 
@@ -42,6 +42,10 @@ OK
 - 一次性下载中断保留文件。
 - `/once/<filename>` 拒绝 HEAD。
 - `/once/<filename>` 拒绝 Range 且不删除文件。
+- `/view/<filename>` 对图片渲染 `<img>`。
+- `/view/<filename>` 对视频渲染 `<video controls>`。
+- `/media/<filename>` 拒绝非媒体文件。
+- `/media/<filename>` 支持 Range 并返回 `206 Partial Content`。
 
 ### 本地 SSR/API 验证
 
@@ -95,6 +99,16 @@ HTTP/1.0 200 OK
 Content-Disposition: attachment; filename="probe.txt"; filename*=UTF-8''probe.txt
 Content-Length: 15
 ```
+
+在线预览补充：
+
+```bash
+curl -s http://127.0.0.1:8081/view/test.mp4 | grep "<video"
+curl -I http://127.0.0.1:8081/media/test.mp4
+curl -H "Range: bytes=0-3" -i http://127.0.0.1:8081/media/test.mp4
+```
+
+期望：预览页由 SSR 输出 `<video>`；`/media/` 返回 `Content-Disposition: inline`；Range 请求返回 `206 Partial Content`。
 
 一次性下载：
 

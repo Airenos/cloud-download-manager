@@ -44,6 +44,8 @@ SINGLE_FILE_LIMIT_BYTES = int(os.environ.get("SINGLE_FILE_LIMIT_BYTES", str(4 * 
 TIMEZONE_CN = timezone(timedelta(hours=8))
 
 ALLOWED_URL_PREFIXES = ("http://", "https://", "magnet:?")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv", ".avi"}
 BANNED_PREFIXES = (
     "/.git",
     "/logs",
@@ -503,6 +505,51 @@ def json_bytes(data: object) -> bytes:
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+def media_kind(filename: str) -> str | None:
+    suffix = Path(filename).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
+def copy_file_range(path: Path, output, start: int, length: int, chunk_size: int = 1024 * 128) -> None:
+    remaining = length
+    with path.open("rb") as f:
+        f.seek(start)
+        while remaining > 0:
+            chunk = f.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            output.write(chunk)
+            remaining -= len(chunk)
+
+
+def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
+    if file_size <= 0 or not range_header.startswith("bytes="):
+        raise ValueError("invalid range")
+    spec = range_header.removeprefix("bytes=").strip()
+    if "," in spec or "-" not in spec:
+        raise ValueError("invalid range")
+    start_text, end_text = spec.split("-", 1)
+    try:
+        if start_text == "":
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                raise ValueError("invalid range")
+            start = max(file_size - suffix_length, 0)
+            end = file_size - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else file_size - 1
+    except ValueError as exc:
+        raise ValueError("invalid range") from exc
+    if start < 0 or end < start or start >= file_size:
+        raise ValueError("invalid range")
+    return start, min(end, file_size - 1)
+
+
 def page(title: str, body: str) -> bytes:
     css = """
     :root { color-scheme: light; --primary: #6d5dfc; --primary-dark: #5144d8; --bg: #f6f7fb; --text: #1f2430; --muted: #6b7280; --line: #e5e7eb; }
@@ -531,6 +578,8 @@ def page(title: str, body: str) -> bytes:
     .empty { padding: 16px; color: var(--muted); text-align: center; }
     .progress { width: 110px; height: 8px; background: #eef0f6; border-radius: 999px; overflow: hidden; margin-top: 5px; }
     .bar { height: 100%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); }
+    .viewer { background: #0f172a; border-radius: 8px; padding: 10px; }
+    .viewer img, .viewer video { display: block; width: 100%; max-height: 72vh; object-fit: contain; border-radius: 6px; background: #0f172a; }
     form.inline { display: inline; }
     label { display: block; font-weight: 650; margin: 10px 0 5px; }
     input[type=text], input[type=password], input[type=url] { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; }
@@ -567,10 +616,12 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
     for item in files:
         name = str(item["name"])
         url_name = str(item["url_name"])
+        preview = f'<a class="button secondary" href="/view/{url_name}">预览</a> ' if media_kind(name) else ""
         if compact:
-            actions = f'<a class="button secondary" href="/file/{url_name}">下载</a>'
+            actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a>'
         else:
             actions = (
+                preview +
                 f'<a class="button secondary" href="/file/{url_name}">普通下载</a> '
                 f'<a class="button" href="/once/{url_name}">一次性下载</a> '
                 f'<button class="secondary" type="button" onclick="copyLink(\'/file/{url_name}\')">复制链接</button>'
@@ -720,6 +771,43 @@ def render_downloads() -> bytes:
     return page("下载目录", body)
 
 
+def render_view(path: Path) -> bytes:
+    kind = media_kind(path.name)
+    url_name = urllib.parse.quote(path.name)
+    media_url = f"/media/{url_name}"
+    download_url = f"/file/{url_name}"
+    once_url = f"/once/{url_name}"
+    if kind == "image":
+        viewer = f'<div class="viewer"><img src="{media_url}" alt="{html.escape(path.name)}"></div>'
+    elif kind == "video":
+        viewer = (
+            '<div class="viewer">'
+            f'<video controls preload="metadata" src="{media_url}">'
+            f'<a href="{download_url}">下载视频</a>'
+            "</video></div>"
+        )
+    else:
+        viewer = '<section><p>这个文件类型暂不支持在线预览，请使用普通下载。</p></section>'
+    body = f"""
+<header>
+  <div>
+    <h1>在线预览</h1>
+    <p class="code">{html.escape(path.name)}</p>
+  </div>
+  <div class="actions">
+    <a class="button secondary" href="/downloads/">返回下载目录</a>
+    <a class="button secondary" href="{download_url}">普通下载</a>
+    <a class="button" href="{once_url}">一次性下载</a>
+  </div>
+</header>
+{viewer}
+<div class="notice">
+  <p>浏览器能否播放视频取决于文件编码；如果无法播放，请使用普通下载。</p>
+</div>
+"""
+    return page(f"在线预览 - {path.name}", body)
+
+
 def success_page(title: str, message: str) -> bytes:
     body = f"""
 <section>
@@ -738,10 +826,10 @@ def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
     return {key: values[-1] if values else "" for key, values in parsed.items()}
 
 
-def content_disposition(filename: str) -> str:
+def content_disposition(filename: str, disposition: str = "attachment") -> str:
     safe_name = filename.replace('"', "'")
     quoted = urllib.parse.quote(filename)
-    return f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{quoted}'
+    return f'{disposition}; filename="{safe_name}"; filename*=UTF-8\'\'{quoted}'
 
 
 class DownloadHandler(BaseHTTPRequestHandler):
@@ -789,6 +877,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
         if raw_path.startswith("/file/"):
             self.handle_file(raw_path.removeprefix("/file/"), head_only=True)
             return
+        if raw_path.startswith("/media/"):
+            self.handle_media(raw_path.removeprefix("/media/"), head_only=True)
+            return
         if raw_path.startswith("/once/"):
             self.send_error_page(405, "一次性下载不支持 HEAD")
             return
@@ -819,6 +910,10 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_bytes(200, json_bytes(scan_files()), "application/json; charset=utf-8")
         elif raw_path == "/api/tasks":
             self.send_bytes(200, json_bytes(get_aria2_tasks()), "application/json; charset=utf-8")
+        elif raw_path.startswith("/view/"):
+            self.handle_view(raw_path.removeprefix("/view/"))
+        elif raw_path.startswith("/media/"):
+            self.handle_media(raw_path.removeprefix("/media/"), head_only=False)
         elif raw_path.startswith("/file/"):
             self.handle_file(raw_path.removeprefix("/file/"), head_only=False)
         elif raw_path.startswith("/once/"):
@@ -907,6 +1002,70 @@ class DownloadHandler(BaseHTTPRequestHandler):
             return
         with path.open("rb") as f:
             shutil.copyfileobj(f, self.wfile)
+
+    def handle_view(self, encoded_name: str) -> None:
+        try:
+            path = safe_download_path(encoded_name)
+        except FileNotFoundError:
+            self.send_error_page(404, "文件不存在")
+            return
+        except ValueError:
+            self.send_error_page(403, "非法文件路径")
+            return
+        self.send_bytes(200, render_view(path))
+
+    def handle_media(self, encoded_name: str, head_only: bool) -> None:
+        try:
+            path = safe_download_path(encoded_name)
+        except FileNotFoundError:
+            self.send_error_page(404, "文件不存在")
+            return
+        except ValueError:
+            self.send_error_page(403, "非法文件路径")
+            return
+        if not media_kind(path.name):
+            self.send_error_page(415, "这个文件类型不支持在线预览")
+            return
+
+        stat = path.stat()
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        range_header = self.headers.get("Range")
+        headers = {
+            "Content-Type": mime,
+            "Content-Disposition": content_disposition(path.name, "inline"),
+            "Accept-Ranges": "bytes",
+            "Last-Modified": email.utils.formatdate(stat.st_mtime, usegmt=True),
+            "X-Content-Type-Options": "nosniff",
+        }
+
+        if range_header:
+            try:
+                start, end = parse_range_header(range_header, stat.st_size)
+            except ValueError:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{stat.st_size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            length = end - start + 1
+            self.send_response(206)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{stat.st_size}")
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+            if not head_only:
+                copy_file_range(path, self.wfile, start, length)
+            return
+
+        self.send_response(200)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(stat.st_size))
+        self.end_headers()
+        if not head_only:
+            with path.open("rb") as f:
+                shutil.copyfileobj(f, self.wfile)
 
     def handle_once(self, encoded_name: str) -> None:
         if self.command != "GET":

@@ -156,6 +156,83 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_view_route_renders_image_preview(self):
+        target = self.ds.DOWNLOADS_DIR / "picture.png"
+        target.write_bytes(b"\x89PNG\r\n\x1a\n")
+        self.ds.save_meta({"picture.png": {"created_at": 1_700_000_000.0}})
+        server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with urllib.request.urlopen(f"{base}/view/picture.png", timeout=3) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("<img", body)
+            self.assertIn("/media/picture.png", body)
+            self.assertNotIn("<video", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_view_route_renders_video_preview(self):
+        target = self.ds.DOWNLOADS_DIR / "clip.mp4"
+        target.write_bytes(b"0123456789")
+        self.ds.save_meta({"clip.mp4": {"created_at": 1_700_000_000.0}})
+        server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with urllib.request.urlopen(f"{base}/view/clip.mp4", timeout=3) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("<video", body)
+            self.assertIn("controls", body)
+            self.assertIn("/media/clip.mp4", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_media_route_rejects_non_media_files(self):
+        target = self.ds.DOWNLOADS_DIR / "notes.txt"
+        target.write_text("hello", encoding="utf-8")
+        self.ds.save_meta({"notes.txt": {"created_at": 1_700_000_000.0}})
+        server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(f"{base}/media/notes.txt", timeout=3)
+            self.assertEqual(error.exception.code, 415)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_media_route_supports_range_for_video_playback(self):
+        target = self.ds.DOWNLOADS_DIR / "range.mp4"
+        target.write_bytes(b"0123456789")
+        self.ds.save_meta({"range.mp4": {"created_at": 1_700_000_000.0}})
+        server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            request = urllib.request.Request(f"{base}/media/range.mp4", headers={"Range": "bytes=2-5"})
+            with urllib.request.urlopen(request, timeout=3) as response:
+                body = response.read()
+                status = response.status
+                content_range = response.headers.get("Content-Range")
+            self.assertEqual(status, 206)
+            self.assertEqual(body, b"2345")
+            self.assertEqual(content_range, "bytes 2-5/10")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()

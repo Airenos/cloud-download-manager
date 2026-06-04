@@ -5,7 +5,8 @@
 ## 功能
 
 - 首页 SSR 渲染：统计、文件列表、任务状态、添加任务表单。
-- 下载目录页：普通下载、一次性下载、复制链接。
+- 下载目录页：预览、普通下载、一次性下载、复制链接。
+- 图片和视频在线预览：使用浏览器原生 `<img>` / `<video>`，不转码。
 - 文件默认保留 24 小时，到期清理。
 - 一次性下载完整传输成功后删除文件；中断不会删除。
 - aria2 RPC 只访问 `127.0.0.1:6800`，secret 不暴露在 HTML。
@@ -99,8 +100,31 @@ cat data/admin_password.txt
 
 - 普通下载：`/file/<filename>`
 - 一次性下载：`/once/<filename>`
+- 在线预览页：`/view/<filename>`
+- 媒体内联读取：`/media/<filename>`
 
 `/downloads/` 是服务端渲染页面，不会暴露 Python 默认目录列表。
+
+## 在线预览
+
+支持图片：
+
+```text
+.jpg .jpeg .png .gif .webp .bmp
+```
+
+支持视频：
+
+```text
+.mp4 .webm .ogg .ogv .mov .m4v .mkv .avi
+```
+
+说明：
+
+- 预览只复用本地文件，不调用外部 CDN，不引入播放器库。
+- `/media/<filename>` 使用 `Content-Disposition: inline`，并支持 Range，方便视频拖动进度。
+- 浏览器能否播放视频取决于封装和编码；例如 H.264/AAC 的 MP4 通常可播，部分 MKV、HEVC 或特殊音频轨可能只能下载。
+- SVG 暂不作为在线图片预览类型，避免把用户文件作为同源可执行内容直接内联。
 
 ## 配置
 
@@ -171,6 +195,7 @@ logs/once-download.log
 - 不提供上传接口。
 - 不访问 `downloads/` 之外的文件。
 - 拒绝路径穿越和 URL 编码绕过。
+- 预览路由同样只允许访问 `downloads/` 内的图片/视频文件。
 - 拒绝 `file://`、`ftp://` 和本地路径。
 - HTML 不显示管理密码或 aria2 RPC secret。
 - 自定义文件名只允许中文、英文、数字、空格、点、下划线和短横线，长度 1~180。
