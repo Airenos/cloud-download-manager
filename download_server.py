@@ -658,7 +658,7 @@ QR_JS = (Path(__file__).resolve().parent / "qr.js").read_text(encoding="utf-8") 
 
 def page(title: str, body: str) -> bytes:
     css = """
-    :root { color-scheme: light; --primary: #6d5dfc; --primary-dark: #5144d8; --bg: #f6f7fb; --text: #1f2430; --muted: #6b7280; --line: #e5e7eb; }
+    :root { color-scheme: light; --primary: #6d5dfc; --primary-dark: #5144d8; --bg: #f6f7fb; --text: #1f2430; --muted: #6b7280; --line: #e5e7eb; --card-bg: #fff; --input-bg: #fff; --file-bg: #fafaff; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
     main { width: min(1100px, calc(100% - 28px)); margin: 0 auto; padding: 28px 0 48px; }
@@ -676,7 +676,7 @@ def page(title: str, body: str) -> bytes:
     button.danger { background: #ef4444; }
     button.danger:hover { background: #dc2626; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 16px 0; }
-    .card, section, details { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); transition: box-shadow .2s, transform .2s; }
+    .card, section, details { background: var(--card-bg); border: 1px solid var(--line); border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); transition: box-shadow .2s, transform .2s; }
     .card:hover { box-shadow: 0 4px 12px rgba(109, 93, 252, 0.10); transform: translateY(-2px); }
     .card strong { display: block; font-size: 22px; margin-top: 6px; color: var(--primary-dark); }
     .card .card-label { font-size: 13px; color: var(--muted); }
@@ -697,11 +697,15 @@ def page(title: str, body: str) -> bytes:
     .viewer img, .viewer video { display: block; width: 100%; max-height: 72vh; object-fit: contain; border-radius: 6px; background: #0f172a; }
     form.inline { display: inline; }
     label { display: block; font-weight: 650; margin: 10px 0 5px; font-size: 14px; }
-    input[type=text], input[type=password], input[type=url] { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; transition: border-color .15s, box-shadow .15s; }
-    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
-    input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: #fafaff; transition: border-color .2s, background .2s; }
+    input[type=text], input[type=password], input[type=url], select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; background: var(--input-bg); color: var(--text); transition: border-color .15s, box-shadow .15s; }
+    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
+    input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: var(--file-bg); color: var(--text); transition: border-color .2s, background .2s; }
     input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #f0edff; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    .search-box { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font: inherit; background: var(--input-bg); color: var(--text); margin-bottom: 10px; }
+    .search-box:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
+    .theme-toggle { background: none; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 16px; line-height: 1; color: var(--text); transition: background .15s; }
+    .theme-toggle:hover { background: var(--line); transform: none; }
     .form-submit { margin-top: 14px; }
     .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
     .code-block { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.6; max-height: 70vh; white-space: pre-wrap; word-break: break-all; }
@@ -711,7 +715,8 @@ def page(title: str, body: str) -> bytes:
     .tag { display: inline-block; background: #eef0ff; color: var(--primary-dark); padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
     .modal-overlay.active { display: flex; }
-    .modal-content { background: #fff; border-radius: 12px; padding: 24px; max-width: 320px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+    .modal-content { background: var(--card-bg); border-radius: 12px; padding: 24px; max-width: 340px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.2); color: var(--text); }
+    .share-actions { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
     .modal-content h3 { margin: 0 0 4px; font-size: 16px; }
     .modal-content p { font-size: 13px; margin: 4px 0 12px; }
     .modal-content canvas { display: block; margin: 0 auto 12px; }
@@ -722,22 +727,29 @@ def page(title: str, body: str) -> bytes:
     .upload-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
     .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    html.dark { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #1e293b; --file-bg: #1e293b; }
+    html.dark .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
+    html.dark .notice { background: #1e293b; border-color: var(--primary); }
+    html.dark .button.secondary, html.dark button.secondary { background: #1e293b; color: var(--primary); }
+    html.dark .button.secondary:hover, html.dark button.secondary:hover { background: #334155; }
+    html.dark input[type=file]:hover, html.dark input[type=file]:focus { background: #334155; border-color: var(--primary); }
+    html.dark tr:hover td { background: #1e293b; }
+    html.dark .filter-btn { background: #1e293b; color: var(--primary); }
+    html.dark .tag { background: #1e293b; color: var(--primary); }
+    html.dark .toast { background: #e2e8f0; color: #0f172a; }
+    html.dark .code-block { background: #1a1a2e; }
+    @media (prefers-color-scheme: dark) { html:not(.light) { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #1e293b; --file-bg: #1e293b; } }
     @media (prefers-color-scheme: dark) {
-      :root { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; }
-      .card, section, details { background: #1e293b; border-color: #334155; }
-      .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
-      .notice { background: #1e293b; border-color: var(--primary); }
-      .button.secondary, button.secondary { background: #1e293b; color: var(--primary); }
-      .button.secondary:hover, button.secondary:hover { background: #334155; }
-      input[type=text], input[type=password], input[type=url], select { background: #1e293b; color: var(--text); border-color: #334155; }
-      input[type=file] { background: #1e293b; border-color: #334155; color: var(--text); }
-      input[type=file]:hover, input[type=file]:focus { background: #334155; border-color: var(--primary); }
-      tr:hover td { background: #1e293b; }
-      .filter-btn { background: #1e293b; color: var(--primary); }
-      .tag { background: #1e293b; color: var(--primary); }
-      .modal-content { background: #1e293b; color: var(--text); }
-      .toast { background: #e2e8f0; color: #0f172a; }
-      .empty { color: var(--muted); }
+      html:not(.light) .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
+      html:not(.light) .notice { background: #1e293b; border-color: var(--primary); }
+      html:not(.light) .button.secondary, html:not(.light) button.secondary { background: #1e293b; color: var(--primary); }
+      html:not(.light) .button.secondary:hover, html:not(.light) button.secondary:hover { background: #334155; }
+      html:not(.light) input[type=file]:hover, html:not(.light) input[type=file]:focus { background: #334155; border-color: var(--primary); }
+      html:not(.light) tr:hover td { background: #1e293b; }
+      html:not(.light) .filter-btn { background: #1e293b; color: var(--primary); }
+      html:not(.light) .tag { background: #1e293b; color: var(--primary); }
+      html:not(.light) .toast { background: #e2e8f0; color: #0f172a; }
+      html:not(.light) .code-block { background: #1a1a2e; }
     }
     @media (max-width: 720px) { header, .form-grid { display: block; } .actions { margin-top: 12px; } th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) { display: none; } }
     """
@@ -798,29 +810,55 @@ def page(title: str, body: str) -> bytes:
       xhr.send(fd);
       return false;
     }
-    function filterFiles(type) {
+    var _curFilter = 'all';
+    var _curSearch = '';
+    function _applyFilters() {
       var rows = document.querySelectorAll('tr[data-type]');
-      var btns = document.querySelectorAll('.filter-btn');
-      for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
-      event.target.classList.add('active');
-      for (var j = 0; j < rows.length; j++) {
-        rows[j].style.display = (type === 'all' || rows[j].getAttribute('data-type') === type) ? '' : 'none';
+      var q = _curSearch.toLowerCase();
+      for (var i = 0; i < rows.length; i++) {
+        var matchType = _curFilter === 'all' || rows[i].getAttribute('data-type') === _curFilter;
+        var matchSearch = !q || rows[i].querySelector('td').textContent.toLowerCase().indexOf(q) >= 0;
+        rows[i].style.display = matchType && matchSearch ? '' : 'none';
       }
     }
-    function showQR(path, name) {
+    function filterFiles(type) {
+      _curFilter = type;
+      var btns = document.querySelectorAll('.filter-btn');
+      for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+      if (event && event.target) event.target.classList.add('active');
+      _applyFilters();
+    }
+    function searchFiles(q) {
+      _curSearch = q;
+      _applyFilters();
+    }
+    function toggleTheme() {
+      var h = document.documentElement;
+      var isDark = h.classList.contains('dark') || (!h.classList.contains('light') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (isDark) {
+        h.classList.remove('dark');
+        h.classList.add('light');
+        localStorage.setItem('theme', 'light');
+      } else {
+        h.classList.remove('light');
+        h.classList.add('dark');
+        localStorage.setItem('theme', 'dark');
+      }
+    }
+    function showShare(path, name) {
       var url = new URL(path, window.location.href).href;
-      var overlay = document.getElementById('qr-modal');
+      var overlay = document.getElementById('share-modal');
       if (!overlay) {
         overlay = document.createElement('div');
-        overlay.id = 'qr-modal';
+        overlay.id = 'share-modal';
         overlay.className = 'modal-overlay';
-        overlay.innerHTML = '<div class="modal-content"><h3 id="qr-name"></h3><p id="qr-url" class="code muted"></p><canvas id="qr-canvas"></canvas><button onclick="closeQR()">\u5173\u95ed</button></div>';
-        overlay.addEventListener('click', function(e) { if (e.target === overlay) closeQR(); });
+        overlay.innerHTML = '<div class="modal-content"><h3 id="share-name"></h3><p id="share-url" class="code muted"></p><canvas id="share-canvas"></canvas><div class="share-actions"><button onclick="shareModalCopy()">\u590d\u5236\u94fe\u63a5</button><button class="secondary" onclick="closeShare()">\u5173\u95ed</button></div></div>';
+        overlay.addEventListener('click', function(e) { if (e.target === overlay) closeShare(); });
         document.body.appendChild(overlay);
       }
-      document.getElementById('qr-name').textContent = name;
-      document.getElementById('qr-url').textContent = url;
-      var canvas = document.getElementById('qr-canvas');
+      document.getElementById('share-name').textContent = name;
+      document.getElementById('share-url').textContent = url;
+      var canvas = document.getElementById('share-canvas');
       if (typeof generateQR === 'function') {
         var matrix = generateQR(url);
         renderQR(canvas, matrix, 4);
@@ -828,17 +866,22 @@ def page(title: str, body: str) -> bytes:
         canvas.width = 200; canvas.height = 40;
         var ctx = canvas.getContext('2d');
         ctx.fillStyle = '#666'; ctx.font = '13px sans-serif';
-        ctx.fillText('QR generator loading...', 10, 25);
+        ctx.fillText('QR loading...', 10, 25);
       }
       overlay.classList.add('active');
     }
-    function closeQR() {
-      var m = document.getElementById('qr-modal');
+    function shareModalCopy() {
+      var urlEl = document.getElementById('share-url');
+      if (urlEl) navigator.clipboard.writeText(urlEl.textContent).then(function(){ showToast('\u94fe\u63a5\u5df2\u590d\u5236'); });
+    }
+    function closeShare() {
+      var m = document.getElementById('share-modal');
       if (m) m.classList.remove('active');
     }
     """
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
+<script>(function(){{var t=localStorage.getItem('theme');if(t==='dark')document.documentElement.classList.add('dark');else if(t==='light')document.documentElement.classList.add('light');}})()</script>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -861,7 +904,7 @@ def retention_select_html(field_id: str) -> str:
         options.append(f'<option value="{val}"{sel}>{label}</option>')
     return (
         f'<label for="{field_id}">保留时间</label>'
-        f'<select id="{field_id}" name="retention" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:10px;font:inherit;background:#fff;">'
+        f'<select id="{field_id}" name="retention">'
         + ''.join(options) +
         '</select>'
     )
@@ -871,14 +914,15 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
     if not files:
         return '<div class="empty">暂无可下载文件</div>'
     filter_bar = (
+        '<input class="search-box" type="text" placeholder="\u641c\u7d22\u6587\u4ef6\u540d..." oninput="searchFiles(this.value)">'
         '<div class="filter-bar">'
-        '<button class="filter-btn active" type="button" onclick="filterFiles(\'all\')">全部</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'image\')">图片</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'video\')">视频</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'text\')">文本</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'document\')">文档</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\')">压缩包</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'other\')">其他</button>'
+        '<button class="filter-btn active" type="button" onclick="filterFiles(\'all\')">\u5168\u90e8</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'image\')">\u56fe\u7247</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'video\')">\u89c6\u9891</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'text\')">\u6587\u672c</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'document\')">\u6587\u6863</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\')">\u538b\u7f29\u5305</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'other\')">\u5176\u4ed6</button>'
         '</div>'
     )
     rows = []
@@ -888,17 +932,16 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         ft = str(item.get("file_type", "other"))
         kind = file_kind(name)
         preview = f'<a class="button secondary" href="/view/{url_name}">预览</a> ' if kind else ""
-        qr_btn = f'<button class="secondary" type="button" onclick="showQR(\'/file/{url_name}\',\'{html.escape(name, quote=True)}\')">二维码</button>'
+        share_btn = f'<button class="secondary" type="button" onclick="showShare(\'/file/{url_name}\',\'{html.escape(name, quote=True)}\')">分享</button>'
         ret_label = html.escape(str(item.get("retention_label", "")))
         if compact:
-            actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a> {qr_btn}'
+            actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a> {share_btn}'
         else:
             actions = (
                 preview +
                 f'<a class="button secondary" href="/file/{url_name}">普通下载</a> '
                 f'<a class="button" href="/once/{url_name}">一次性下载</a> '
-                f'<button class="secondary" type="button" onclick="copyLink(\'/file/{url_name}\')">复制链接</button> '
-                + qr_btn
+                + share_btn
             )
         rows.append(
             f'<tr data-type="{ft}">'
@@ -973,6 +1016,7 @@ def render_home(message: str = "") -> bytes:
   <div class="actions">
     <a class="button" href="/downloads/">下载目录</a>
     <button class="secondary" type="button" onclick="location.reload()">刷新</button>
+    <button class="theme-toggle" type="button" onclick="toggleTheme()" title="切换主题">🌓</button>
   </div>
 </header>
 {message_html}
@@ -1061,6 +1105,7 @@ def render_downloads() -> bytes:
   <div class="actions">
     <a class="button secondary" href="/">返回首页</a>
     <button class="secondary" type="button" onclick="location.reload()">刷新</button>
+    <button class="theme-toggle" type="button" onclick="toggleTheme()" title="切换主题">🌓</button>
   </div>
 </header>
 <div class="cards">
@@ -1112,6 +1157,7 @@ def render_view(path: Path) -> bytes:
     <a class="button secondary" href="/downloads/">返回下载目录</a>
     <a class="button secondary" href="{download_url}">普通下载</a>
     <a class="button" href="{once_url}">一次性下载</a>
+    <button class="theme-toggle" type="button" onclick="toggleTheme()" title="切换主题">🌓</button>
   </div>
 </header>
 {viewer}
