@@ -160,10 +160,11 @@ def get_downloads_usage() -> int:
     return total
 
 
-def get_disk_stats() -> dict[str, int | str]:
+def get_disk_stats() -> dict[str, object]:
     ensure_directories()
     usage = shutil.disk_usage(DOWNLOADS_DIR)
     used = get_downloads_usage()
+    disk_pct = (usage.used / usage.total * 100) if usage.total else 0
     return {
         "total": usage.total,
         "used": usage.used,
@@ -173,6 +174,8 @@ def get_disk_stats() -> dict[str, int | str]:
         "used_human": format_size(usage.used),
         "free_human": format_size(usage.free),
         "downloads_used_human": format_size(used),
+        "disk_percent": round(disk_pct, 1),
+        "disk_danger": usage.free < MIN_FREE_BYTES,
     }
 
 
@@ -294,6 +297,22 @@ def cleanup_expired() -> list[str]:
     if changed:
         save_meta(meta)
     return removed
+
+
+def renew_file(filename: str, password: str) -> None:
+    if not check_admin_password(password):
+        raise PermissionError("管理密码错误")
+    meta = load_meta()
+    if filename not in meta:
+        raise FileNotFoundError("文件不存在或已过期")
+    path = DOWNLOADS_DIR / filename
+    if not path.exists():
+        meta.pop(filename, None)
+        save_meta(meta)
+        raise FileNotFoundError("文件不存在或已过期")
+    meta[filename]["created_at"] = now_ts()
+    save_meta(meta)
+    append_log("renew.log", f"renewed name={filename}")
 
 
 def validate_custom_filename(filename: str) -> str:
@@ -709,6 +728,14 @@ def page(title: str, body: str) -> bytes:
     .form-submit { margin-top: 14px; }
     .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
     .code-block { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.6; max-height: 70vh; white-space: pre-wrap; word-break: break-all; }
+    .disk-bar-outer { width: 100%; height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; margin-top: 8px; }
+    .disk-bar-inner { height: 100%; border-radius: 999px; transition: width .3s; background: linear-gradient(90deg, #22c55e, #84cc16); }
+    .disk-bar-inner.warn { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+    .disk-bar-inner.danger { background: #ef4444; }
+    .drop-zone { border: 2px dashed var(--line); border-radius: 10px; padding: 32px 16px; text-align: center; color: var(--muted); font-size: 14px; cursor: pointer; transition: border-color .2s, background .2s, transform .15s; position: relative; }
+    .drop-zone:hover, .drop-zone.drag-over { border-color: var(--primary); background: rgba(109,93,252,0.06); transform: scale(1.01); }
+    .drop-zone.drag-over { border-style: solid; }
+    .drop-zone input[type=file] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
     .filter-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
     .filter-btn { background: #eef0ff; color: var(--primary-dark); border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s; }
     .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
@@ -810,6 +837,32 @@ def page(title: str, body: str) -> bytes:
       xhr.send(fd);
       return false;
     }
+    (function() {
+      var zone = document.getElementById('drop-zone');
+      var input = document.getElementById('upload-file');
+      var nameEl = document.getElementById('drop-file-name');
+      if (!zone || !input) return;
+      input.addEventListener('change', function() {
+        if (input.files.length) nameEl.textContent = '\u5df2\u9009\u62e9: ' + input.files[0].name;
+        else nameEl.textContent = '';
+      });
+      zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+      zone.addEventListener('dragenter', function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+      zone.addEventListener('dragleave', function() { zone.classList.remove('drag-over'); });
+      zone.addEventListener('drop', function(e) {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        if (e.dataTransfer.files.length) {
+          input.files = e.dataTransfer.files;
+          nameEl.textContent = '\u5df2\u9009\u62e9: ' + e.dataTransfer.files[0].name;
+        }
+      });
+      document.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        var det = zone.closest('details');
+        if (det && !det.open) det.open = true;
+      });
+    })();
     var _curFilter = 'all';
     var _curSearch = '';
     function _applyFilters() {
@@ -937,11 +990,17 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         if compact:
             actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a> {share_btn}'
         else:
+            renew_btn = (
+                f'<form class="inline" method="post" action="/api/renew">'
+                f'<input type="hidden" name="filename" value="{html.escape(name, quote=True)}">'
+                f'<input type="password" name="password" placeholder="\u5bc6\u7801" style="width:70px;padding:5px 6px;font-size:12px;" required>'
+                f'<button class="secondary" type="submit" style="font-size:12px;padding:5px 8px;">\u7eed\u547d</button></form>'
+            )
             actions = (
                 preview +
                 f'<a class="button secondary" href="/file/{url_name}">普通下载</a> '
                 f'<a class="button" href="/once/{url_name}">一次性下载</a> '
-                + share_btn
+                + share_btn + ' ' + renew_btn
             )
         rows.append(
             f'<tr data-type="{ft}">'
@@ -1022,7 +1081,9 @@ def render_home(message: str = "") -> bytes:
 {message_html}
 <div class="cards">
   <div class="card">下载目录占用<strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
-  <div class="card">剩余磁盘空间<strong>{html.escape(str(stats["free_human"]))}</strong></div>
+  <div class="card">剩余磁盘空间<strong>{html.escape(str(stats["free_human"]))}</strong>
+    <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
+  </div>
   <div class="card">文件数量<strong>{len(files)}</strong></div>
   <div class="card">默认保留<strong>{RETENTION_HOURS:g}h</strong></div>
 </div>
@@ -1060,9 +1121,12 @@ def render_home(message: str = "") -> bytes:
 <details>
   <summary>上传本地文件</summary>
   <p>管理密码用于防止他人滥用上传功能，普通下载不需要密码。</p>
-  <form method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="return handleUpload(this)">
-    <label for="upload-file">选择文件</label>
-    <input id="upload-file" name="file" type="file" required>
+  <form id="upload-form" method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="return handleUpload(this)">
+    <div id="drop-zone" class="drop-zone">
+      <p>📁 拖拽文件到这里，或点击选择文件</p>
+      <input id="upload-file" name="file" type="file" required>
+    </div>
+    <div id="drop-file-name" class="muted" style="margin:6px 0;font-size:13px;"></div>
     <div class="form-grid">
       <div>
         <label for="upload-filename">自定义文件名（可选）</label>
@@ -1110,7 +1174,9 @@ def render_downloads() -> bytes:
 </header>
 <div class="cards">
   <div class="card">下载目录占用<strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
-  <div class="card">剩余磁盘空间<strong>{html.escape(str(stats["free_human"]))}</strong></div>
+  <div class="card">剩余磁盘空间<strong>{html.escape(str(stats["free_human"]))}</strong>
+    <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
+  </div>
   <div class="card">文件数量<strong>{len(files)}</strong></div>
 </div>
 <section>
@@ -1303,6 +1369,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_remove_task(form)
         elif raw_path == "/api/clear-stopped":
             self.handle_clear_stopped(form)
+        elif raw_path == "/api/renew":
+            self.handle_renew(form)
         else:
             self.send_error_page(404, "接口不存在")
 
@@ -1340,6 +1408,22 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_error_page(400, f"清理失败：{exc}")
             return
         self.send_bytes(200, success_page("已清理任务记录", f"清理数量：{count}"))
+
+    def handle_renew(self, form: dict[str, str]) -> None:
+        filename = form.get("filename", "").strip()
+        password = form.get("password", "")
+        try:
+            renew_file(filename, password)
+        except PermissionError:
+            self.send_error_page(403, "管理密码错误")
+            return
+        except FileNotFoundError as exc:
+            self.send_error_page(404, str(exc))
+            return
+        except Exception as exc:
+            self.send_error_page(400, f"续命失败：{exc}")
+            return
+        self.send_bytes(200, success_page("续命成功", f"{filename} 的保留时间已重置。"))
 
     def handle_upload(self) -> None:
         content_type = self.headers.get("Content-Type", "")
