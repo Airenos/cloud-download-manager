@@ -232,17 +232,35 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             thread.join(timeout=3)
 
     def test_media_route_rejects_non_media_files(self):
-        target = self.ds.DOWNLOADS_DIR / "notes.txt"
-        target.write_text("hello", encoding="utf-8")
-        self.ds.save_meta({"notes.txt": {"created_at": 1_700_000_000.0}})
+        target = self.ds.DOWNLOADS_DIR / "data.bin"
+        target.write_bytes(b"binary content")
+        self.ds.save_meta({"data.bin": {"created_at": 1_700_000_000.0}})
         server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         try:
             with self.assertRaises(urllib.error.HTTPError) as error:
-                urllib.request.urlopen(f"{base}/media/notes.txt", timeout=3)
+                urllib.request.urlopen(f"{base}/media/data.bin", timeout=3)
             self.assertEqual(error.exception.code, 415)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_view_route_renders_text_preview(self):
+        target = self.ds.DOWNLOADS_DIR / "notes.txt"
+        target.write_text("hello world\nline2", encoding="utf-8")
+        self.ds.save_meta({"notes.txt": {"created_at": 1_700_000_000.0}})
+        server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            resp = urllib.request.urlopen(f"{base}/view/notes.txt", timeout=3)
+            body = resp.read().decode()
+            self.assertIn("hello world", body)
+            self.assertIn("code-block", body)
         finally:
             server.shutdown()
             server.server_close()

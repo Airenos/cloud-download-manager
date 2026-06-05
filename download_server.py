@@ -51,6 +51,20 @@ TIMEZONE_CN = timezone(timedelta(hours=8))
 ALLOWED_URL_PREFIXES = ("http://", "https://")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv", ".avi"}
+TEXT_EXTENSIONS = {".txt", ".md", ".json", ".log", ".conf", ".cfg", ".ini",
+                   ".yaml", ".yml", ".xml", ".csv", ".sh", ".py", ".js",
+                   ".css", ".html", ".toml", ".env", ".bat"}
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz"}
+DOC_EXTENSIONS = {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".odt", ".ods"}
+TEXT_PREVIEW_MAX_BYTES = 512 * 1024
+RETENTION_OPTIONS = [
+    (3600, "1 小时"),
+    (43200, "12 小时"),
+    (86400, "24 小时"),
+    (259200, "3 天"),
+    (604800, "7 天"),
+]
+RETENTION_OPTIONS_SET = {v for v, _ in RETENTION_OPTIONS}
 BANNED_PREFIXES = (
     "/.git",
     "/logs",
@@ -177,7 +191,10 @@ def load_meta() -> dict[str, dict[str, float]]:
     for name, item in data.items():
         if isinstance(name, str) and isinstance(item, dict):
             try:
-                result[name] = {"created_at": float(item["created_at"])}
+                entry: dict[str, float] = {"created_at": float(item["created_at"])}
+                if "retention_seconds" in item:
+                    entry["retention_seconds"] = float(item["retention_seconds"])
+                result[name] = entry
             except (KeyError, TypeError, ValueError):
                 continue
     return result
@@ -222,8 +239,10 @@ def scan_files() -> list[dict[str, object]]:
     files = []
     for name in sorted(current_files, key=str.casefold):
         path = DOWNLOADS_DIR / name
-        created_at = meta[name]["created_at"]
-        expires_at = created_at + RETENTION_SECONDS
+        entry = meta[name]
+        created_at = entry["created_at"]
+        ret_secs = entry.get("retention_seconds", RETENTION_SECONDS)
+        expires_at = created_at + ret_secs
         files.append(
             {
                 "name": name,
@@ -234,6 +253,8 @@ def scan_files() -> list[dict[str, object]]:
                 "expires_at": expires_at,
                 "expires_at_text": format_time(expires_at),
                 "remaining_text": format_remaining(expires_at),
+                "retention_label": format_retention(ret_secs),
+                "file_type": file_type(name),
                 "url_name": urllib.parse.quote(name),
             }
         )
@@ -250,7 +271,7 @@ def append_log(log_name: str, message: str) -> None:
 def cleanup_expired() -> list[str]:
     ensure_directories()
     meta = load_meta()
-    cutoff = now_ts() - RETENTION_SECONDS
+    now = now_ts()
     removed: list[str] = []
     changed = False
     for name, item in list(meta.items()):
@@ -259,7 +280,9 @@ def cleanup_expired() -> list[str]:
             meta.pop(name, None)
             changed = True
             continue
-        if item.get("created_at", now_ts()) <= cutoff:
+        ret_secs = item.get("retention_seconds", RETENTION_SECONDS)
+        created = item.get("created_at", now)
+        if created + ret_secs <= now:
             with contextlib.suppress(OSError):
                 path.unlink()
             with contextlib.suppress(OSError):
@@ -375,7 +398,7 @@ def ensure_can_store_new_file() -> None:
         raise RuntimeError(f"downloads 目录超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}，已拒绝上传")
 
 
-def save_uploaded_file(filename: str, source_file) -> int:
+def save_uploaded_file(filename: str, source_file, retention_seconds: int = 0) -> int:
     ensure_directories()
     ensure_can_store_new_file()
     name = validate_custom_filename(filename)
@@ -400,7 +423,10 @@ def save_uploaded_file(filename: str, source_file) -> int:
                 out.write(chunk)
         tmp_path.replace(target)
         meta = load_meta()
-        meta[name] = {"created_at": now_ts()}
+        entry: dict[str, float] = {"created_at": now_ts()}
+        if retention_seconds and retention_seconds in RETENTION_OPTIONS_SET:
+            entry["retention_seconds"] = float(retention_seconds)
+        meta[name] = entry
         save_meta(meta)
         append_log("upload.log", f"uploaded name={name} size={written}")
         return written
@@ -432,15 +458,22 @@ def aria2_rpc(method: str, params: list[object] | None = None) -> object:
     return data.get("result")
 
 
-def add_aria2_task(url: str, filename: str | None = None) -> str:
+def add_aria2_task(url: str, filename: str | None = None, retention_seconds: int = 0) -> str:
     validated_url = validate_task_url(url)
     ensure_can_add_task(validated_url)
     options = {"dir": str(DOWNLOADS_DIR)}
+    out_name: str | None = None
     if filename:
-        options["out"] = validate_custom_filename(filename)
+        out_name = validate_custom_filename(filename)
+        options["out"] = out_name
     result = aria2_rpc("aria2.addUri", [[validated_url], options])
     if not isinstance(result, str):
         raise RuntimeError("aria2 未返回 GID")
+    if out_name and retention_seconds and retention_seconds in RETENTION_OPTIONS_SET:
+        meta = load_meta()
+        if out_name not in meta:
+            meta[out_name] = {"created_at": now_ts(), "retention_seconds": float(retention_seconds)}
+            save_meta(meta)
     return result
 
 
@@ -551,13 +584,37 @@ def json_bytes(data: object) -> bytes:
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def media_kind(filename: str) -> str | None:
+def file_kind(filename: str) -> str | None:
     suffix = Path(filename).suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
         return "image"
     if suffix in VIDEO_EXTENSIONS:
         return "video"
+    if suffix in TEXT_EXTENSIONS:
+        return "text"
     return None
+
+
+def file_type(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
+    if suffix in TEXT_EXTENSIONS:
+        return "text"
+    if suffix in ARCHIVE_EXTENSIONS:
+        return "archive"
+    if suffix in DOC_EXTENSIONS:
+        return "document"
+    return "other"
+
+
+def format_retention(seconds: float) -> str:
+    hours = seconds / 3600
+    if hours < 24:
+        return f"{hours:g}h"
+    return f"{hours / 24:g}d"
 
 
 def copy_file_range(path: Path, output, start: int, length: int, chunk_size: int = 1024 * 128) -> None:
@@ -594,6 +651,9 @@ def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
     if start < 0 or end < start or start >= file_size:
         raise ValueError("invalid range")
     return start, min(end, file_size - 1)
+
+
+QR_JS = (Path(__file__).resolve().parent / "qr.js").read_text(encoding="utf-8") if (Path(__file__).resolve().parent / "qr.js").exists() else ""
 
 
 def page(title: str, body: str) -> bytes:
@@ -641,9 +701,20 @@ def page(title: str, body: str) -> bytes:
     input[type=text]:focus, input[type=password]:focus, input[type=url]:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
     input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: #fafaff; transition: border-color .2s, background .2s; }
     input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #f0edff; }
-    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
     .form-submit { margin-top: 14px; }
     .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    .code-block { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; line-height: 1.6; max-height: 70vh; white-space: pre-wrap; word-break: break-all; }
+    .filter-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .filter-btn { background: #eef0ff; color: var(--primary-dark); border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s; }
+    .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
+    .tag { display: inline-block; background: #eef0ff; color: var(--primary-dark); padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
+    .modal-overlay.active { display: flex; }
+    .modal-content { background: #fff; border-radius: 12px; padding: 24px; max-width: 320px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+    .modal-content h3 { margin: 0 0 4px; font-size: 16px; }
+    .modal-content p { font-size: 13px; margin: 4px 0 12px; }
+    .modal-content canvas { display: block; margin: 0 auto 12px; }
     .upload-progress { display: none; margin-top: 12px; }
     .upload-progress.active { display: block; }
     .upload-bar-outer { width: 100%; height: 10px; background: #eef0f6; border-radius: 999px; overflow: hidden; }
@@ -651,6 +722,23 @@ def page(title: str, body: str) -> bytes:
     .upload-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
     .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    @media (prefers-color-scheme: dark) {
+      :root { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; }
+      .card, section, details { background: #1e293b; border-color: #334155; }
+      .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
+      .notice { background: #1e293b; border-color: var(--primary); }
+      .button.secondary, button.secondary { background: #1e293b; color: var(--primary); }
+      .button.secondary:hover, button.secondary:hover { background: #334155; }
+      input[type=text], input[type=password], input[type=url], select { background: #1e293b; color: var(--text); border-color: #334155; }
+      input[type=file] { background: #1e293b; border-color: #334155; color: var(--text); }
+      input[type=file]:hover, input[type=file]:focus { background: #334155; border-color: var(--primary); }
+      tr:hover td { background: #1e293b; }
+      .filter-btn { background: #1e293b; color: var(--primary); }
+      .tag { background: #1e293b; color: var(--primary); }
+      .modal-content { background: #1e293b; color: var(--text); }
+      .toast { background: #e2e8f0; color: #0f172a; }
+      .empty { color: var(--muted); }
+    }
     @media (max-width: 720px) { header, .form-grid { display: block; } .actions { margin-top: 12px; } th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) { display: none; } }
     """
     script = """
@@ -710,6 +798,44 @@ def page(title: str, body: str) -> bytes:
       xhr.send(fd);
       return false;
     }
+    function filterFiles(type) {
+      var rows = document.querySelectorAll('tr[data-type]');
+      var btns = document.querySelectorAll('.filter-btn');
+      for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
+      event.target.classList.add('active');
+      for (var j = 0; j < rows.length; j++) {
+        rows[j].style.display = (type === 'all' || rows[j].getAttribute('data-type') === type) ? '' : 'none';
+      }
+    }
+    function showQR(path, name) {
+      var url = new URL(path, window.location.href).href;
+      var overlay = document.getElementById('qr-modal');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'qr-modal';
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = '<div class="modal-content"><h3 id="qr-name"></h3><p id="qr-url" class="code muted"></p><canvas id="qr-canvas"></canvas><button onclick="closeQR()">\u5173\u95ed</button></div>';
+        overlay.addEventListener('click', function(e) { if (e.target === overlay) closeQR(); });
+        document.body.appendChild(overlay);
+      }
+      document.getElementById('qr-name').textContent = name;
+      document.getElementById('qr-url').textContent = url;
+      var canvas = document.getElementById('qr-canvas');
+      if (typeof generateQR === 'function') {
+        var matrix = generateQR(url);
+        renderQR(canvas, matrix, 4);
+      } else {
+        canvas.width = 200; canvas.height = 40;
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#666'; ctx.font = '13px sans-serif';
+        ctx.fillText('QR generator loading...', 10, 25);
+      }
+      overlay.classList.add('active');
+    }
+    function closeQR() {
+      var m = document.getElementById('qr-modal');
+      if (m) m.classList.remove('active');
+    }
     """
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
@@ -722,40 +848,72 @@ def page(title: str, body: str) -> bytes:
 <body>
   <main>{body}</main>
   <script>{script}</script>
+  <script>{QR_JS}</script>
 </body>
 </html>"""
     return html_doc.encode("utf-8")
 
 
+def retention_select_html(field_id: str) -> str:
+    options = []
+    for val, label in RETENTION_OPTIONS:
+        sel = ' selected' if val == RETENTION_SECONDS else ''
+        options.append(f'<option value="{val}"{sel}>{label}</option>')
+    return (
+        f'<label for="{field_id}">保留时间</label>'
+        f'<select id="{field_id}" name="retention" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:10px;font:inherit;background:#fff;">'
+        + ''.join(options) +
+        '</select>'
+    )
+
+
 def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> str:
     if not files:
         return '<div class="empty">暂无可下载文件</div>'
+    filter_bar = (
+        '<div class="filter-bar">'
+        '<button class="filter-btn active" type="button" onclick="filterFiles(\'all\')">全部</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'image\')">图片</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'video\')">视频</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'text\')">文本</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'document\')">文档</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\')">压缩包</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'other\')">其他</button>'
+        '</div>'
+    )
     rows = []
     for item in files:
         name = str(item["name"])
         url_name = str(item["url_name"])
-        preview = f'<a class="button secondary" href="/view/{url_name}">预览</a> ' if media_kind(name) else ""
+        ft = str(item.get("file_type", "other"))
+        kind = file_kind(name)
+        preview = f'<a class="button secondary" href="/view/{url_name}">预览</a> ' if kind else ""
+        qr_btn = f'<button class="secondary" type="button" onclick="showQR(\'/file/{url_name}\',\'{html.escape(name, quote=True)}\')">二维码</button>'
+        ret_label = html.escape(str(item.get("retention_label", "")))
         if compact:
-            actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a>'
+            actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a> {qr_btn}'
         else:
             actions = (
                 preview +
                 f'<a class="button secondary" href="/file/{url_name}">普通下载</a> '
                 f'<a class="button" href="/once/{url_name}">一次性下载</a> '
-                f'<button class="secondary" type="button" onclick="copyLink(\'/file/{url_name}\')">复制链接</button>'
+                f'<button class="secondary" type="button" onclick="copyLink(\'/file/{url_name}\')">复制链接</button> '
+                + qr_btn
             )
         rows.append(
-            "<tr>"
+            f'<tr data-type="{ft}">'
             f'<td class="code">{html.escape(name)}</td>'
             f"<td>{html.escape(str(item['size_human']))}</td>"
             f"<td>{html.escape(str(item['created_at_text']))}</td>"
             f"<td>{html.escape(str(item['expires_at_text']))}</td>"
             f"<td>{html.escape(str(item['remaining_text']))}</td>"
+            f'<td><span class="tag">{ret_label}</span></td>'
             f'<td class="row-actions">{actions}</td>'
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>文件名</th><th>大小</th><th>入库时间</th><th>过期时间</th><th>剩余时间</th><th>操作</th></tr></thead>"
+        filter_bar +
+        "<table><thead><tr><th>文件名</th><th>大小</th><th>入库时间</th><th>过期时间</th><th>剩余时间</th><th>保留</th><th>操作</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
 
@@ -822,7 +980,7 @@ def render_home(message: str = "") -> bytes:
   <div class="card">下载目录占用<strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
   <div class="card">剩余磁盘空间<strong>{html.escape(str(stats["free_human"]))}</strong></div>
   <div class="card">文件数量<strong>{len(files)}</strong></div>
-  <div class="card">保留时间<strong>{RETENTION_HOURS:g} 小时</strong></div>
+  <div class="card">默认保留<strong>{RETENTION_HOURS:g}h</strong></div>
 </div>
 <section>
   <h2>可用文件</h2>
@@ -844,11 +1002,14 @@ def render_home(message: str = "") -> bytes:
         <input id="filename" name="filename" type="text" maxlength="180" placeholder="example.zip">
       </div>
       <div>
+        {retention_select_html('task-retention')}
+      </div>
+      <div>
         <label for="password">管理密码</label>
         <input id="password" name="password" type="password" required>
       </div>
     </div>
-    <p class="muted">文件名只允许中文、英文、数字、空格、点、下划线和短横线。</p>
+    <p class="muted">文件名只允许中文、英文、数字、空格、点、下划线和短横线。保留时间仅在指定文件名时生效。</p>
     <input type="submit" value="添加任务">
   </form>
 </details>
@@ -860,8 +1021,11 @@ def render_home(message: str = "") -> bytes:
     <input id="upload-file" name="file" type="file" required>
     <div class="form-grid">
       <div>
-        <label for="upload-filename">自定义文件名（可选，留空使用原文件名）</label>
+        <label for="upload-filename">自定义文件名（可选）</label>
         <input id="upload-filename" name="filename" type="text" maxlength="180">
+      </div>
+      <div>
+        {retention_select_html('upload-retention')}
       </div>
       <div>
         <label for="upload-password">管理密码</label>
@@ -877,7 +1041,7 @@ def render_home(message: str = "") -> bytes:
   </form>
 </details>
 <div class="notice">
-  <p>所有文件 {RETENTION_HOURS:g} 小时后自动删除；一次性下载在完整下载成功后自动删除。</p>
+  <p>文件按设定时间自动删除（可选1h/12h/24h/3d/7d）；一次性下载完整成功后立即删除。</p>
   <p>仅用于合法资源临时中转。剩余空间低于 {format_size(MIN_FREE_BYTES)} 时会拒绝新任务。</p>
 </div>
 """
@@ -913,7 +1077,7 @@ def render_downloads() -> bytes:
 
 
 def render_view(path: Path) -> bytes:
-    kind = media_kind(path.name)
+    kind = file_kind(path.name)
     url_name = urllib.parse.quote(path.name)
     media_url = f"/media/{url_name}"
     download_url = f"/file/{url_name}"
@@ -927,6 +1091,15 @@ def render_view(path: Path) -> bytes:
             f'<a href="{download_url}">下载视频</a>'
             "</video></div>"
         )
+    elif kind == "text":
+        try:
+            raw = path.read_bytes()[:TEXT_PREVIEW_MAX_BYTES]
+            text_content = raw.decode("utf-8", errors="replace")
+            truncated = ' <span class="muted">(文件过大，仅显示前 512KB)</span>' if path.stat().st_size > TEXT_PREVIEW_MAX_BYTES else ""
+        except Exception:
+            text_content = "无法读取文件内容"
+            truncated = ""
+        viewer = f'<section><p>文本预览{truncated}</p><pre class="code-block"><code>{html.escape(text_content)}</code></pre></section>'
     else:
         viewer = '<section><p>这个文件类型暂不支持在线预览，请使用普通下载。</p></section>'
     body = f"""
@@ -1093,7 +1266,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             return
         try:
             filename = form.get("filename", "").strip() or None
-            gid = add_aria2_task(form.get("url", ""), filename)
+            retention = int(form.get("retention", "0") or "0")
+            gid = add_aria2_task(form.get("url", ""), filename, retention)
         except Exception as exc:
             self.send_error_page(400, f"添加任务失败：{exc}")
             return
@@ -1145,8 +1319,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
             return
         custom_name = (form.getfirst("filename", "") or "").strip()
         filename = custom_name if custom_name else file_field.filename
+        retention = int(form.getfirst("retention", "0") or "0")
         try:
-            written = save_uploaded_file(filename, file_field.file)
+            written = save_uploaded_file(filename, file_field.file, retention)
         except FileExistsError as exc:
             self.send_error_page(409, str(exc))
             return
@@ -1202,12 +1377,16 @@ class DownloadHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error_page(403, "非法文件路径")
             return
-        if not media_kind(path.name):
+        if not file_kind(path.name):
             self.send_error_page(415, "这个文件类型不支持在线预览")
             return
 
         stat = path.stat()
-        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        kind = file_kind(path.name)
+        if kind == "text":
+            mime = "text/plain; charset=utf-8"
+        else:
+            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         range_header = self.headers.get("Range")
         headers = {
             "Content-Type": mime,
