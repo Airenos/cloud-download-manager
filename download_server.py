@@ -7,6 +7,7 @@ import contextlib
 import email.utils
 import hmac
 import html
+import io
 import json
 import mimetypes
 import os
@@ -18,15 +19,11 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-import warnings
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", DeprecationWarning)
-    import cgi
 
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", Path(__file__).resolve().parent)).resolve()
@@ -426,18 +423,19 @@ def save_uploaded_file(filename: str, source_file, retention_seconds: int = 0) -
     if target.exists():
         raise FileExistsError("同名文件已存在，已拒绝覆盖")
 
+    budget = MAX_DOWNLOAD_DIR_BYTES - get_downloads_usage()
     tmp_path = DOWNLOADS_DIR / f".upload-{secrets.token_hex(8)}.tmp"
     written = 0
     try:
         with tmp_path.open("wb") as out:
             while True:
-                chunk = source_file.read(1024 * 128)
+                chunk = source_file.read(1024 * 1024)
                 if not chunk:
                     break
                 written += len(chunk)
                 if written > SINGLE_FILE_LIMIT_BYTES:
                     raise RuntimeError(f"上传文件超过单文件限制 {format_size(SINGLE_FILE_LIMIT_BYTES)}")
-                if get_downloads_usage() + written > MAX_DOWNLOAD_DIR_BYTES:
+                if written > budget:
                     raise RuntimeError(f"downloads 目录将超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}，已拒绝上传")
                 out.write(chunk)
         tmp_path.replace(target)
@@ -677,7 +675,7 @@ QR_JS = (Path(__file__).resolve().parent / "qr.js").read_text(encoding="utf-8") 
 
 def page(title: str, body: str) -> bytes:
     css = """
-    :root { color-scheme: light; --primary: #6d5dfc; --primary-dark: #5144d8; --bg: #f6f7fb; --text: #1f2430; --muted: #6b7280; --line: #e5e7eb; --card-bg: #fff; --input-bg: #fff; --file-bg: #fafaff; }
+    :root { color-scheme: light; --primary: #6d5dfc; --primary-dark: #5144d8; --bg: #f6f7fb; --text: #1f2430; --muted: #6b7280; --line: #e5e7eb; --card-bg: #fff; --input-bg: #fff; --input-border: #e5e7eb; --file-bg: #fafaff; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
     main { width: min(1100px, calc(100% - 28px)); margin: 0 auto; padding: 28px 0 48px; }
@@ -706,22 +704,22 @@ def page(title: str, body: str) -> bytes:
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 10px 8px; vertical-align: top; }
     th { color: var(--muted); font-size: 13px; text-transform: none; }
-    tr:hover td { background: #fafaff; }
+    tr:hover td { background: rgba(109,93,252,0.04); }
     .muted { color: var(--muted); }
-    .notice { background: #fff; border-left: 4px solid var(--primary); padding: 12px 14px; border-radius: 8px; margin-top: 14px; }
+    .notice { background: var(--card-bg); border-left: 4px solid var(--primary); padding: 12px 14px; border-radius: 8px; margin-top: 14px; }
     .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
-    .progress { width: 110px; height: 8px; background: #eef0f6; border-radius: 999px; overflow: hidden; margin-top: 5px; }
+    .progress { width: 110px; height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; margin-top: 5px; }
     .bar { height: 100%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); transition: width .3s; }
     .viewer { background: #0f172a; border-radius: 8px; padding: 10px; }
     .viewer img, .viewer video { display: block; width: 100%; max-height: 72vh; object-fit: contain; border-radius: 6px; background: #0f172a; }
     form.inline { display: inline; }
     label { display: block; font-weight: 650; margin: 10px 0 5px; font-size: 14px; }
-    input[type=text], input[type=password], input[type=url], select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; background: var(--input-bg); color: var(--text); transition: border-color .15s, box-shadow .15s; }
+    input[type=text], input[type=password], input[type=url], select { width: 100%; border: 1px solid var(--input-border); border-radius: 8px; padding: 10px; font: inherit; background: var(--input-bg); color: var(--text); transition: border-color .15s, box-shadow .15s; }
     input[type=text]:focus, input[type=password]:focus, input[type=url]:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
     input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: var(--file-bg); color: var(--text); transition: border-color .2s, background .2s; }
     input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #f0edff; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-    .search-box { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font: inherit; background: var(--input-bg); color: var(--text); margin-bottom: 10px; }
+    .search-box { width: 100%; border: 1px solid var(--input-border); border-radius: 8px; padding: 8px 12px; font: inherit; background: var(--input-bg); color: var(--text); margin-bottom: 10px; }
     .search-box:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
     .theme-toggle { background: none; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 16px; line-height: 1; color: var(--text); transition: background .15s; }
     .theme-toggle:hover { background: var(--line); transform: none; }
@@ -754,25 +752,27 @@ def page(title: str, body: str) -> bytes:
     .upload-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
     .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-    html.dark { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #1e293b; --file-bg: #1e293b; }
+    html.dark { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #0f172a; --input-border: #475569; --file-bg: #1e293b; }
     html.dark .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
     html.dark .notice { background: #1e293b; border-color: var(--primary); }
     html.dark .button.secondary, html.dark button.secondary { background: #1e293b; color: var(--primary); }
     html.dark .button.secondary:hover, html.dark button.secondary:hover { background: #334155; }
     html.dark input[type=file]:hover, html.dark input[type=file]:focus { background: #334155; border-color: var(--primary); }
-    html.dark tr:hover td { background: #1e293b; }
+    html.dark tr:hover td { background: rgba(129,140,248,0.06); }
+    html.dark .upload-bar-outer, html.dark .disk-bar-outer { background: #334155; }
     html.dark .filter-btn { background: #1e293b; color: var(--primary); }
     html.dark .tag { background: #1e293b; color: var(--primary); }
     html.dark .toast { background: #e2e8f0; color: #0f172a; }
     html.dark .code-block { background: #1a1a2e; }
-    @media (prefers-color-scheme: dark) { html:not(.light) { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #1e293b; --file-bg: #1e293b; } }
+    @media (prefers-color-scheme: dark) { html:not(.light) { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #0f172a; --input-border: #475569; --file-bg: #1e293b; } }
     @media (prefers-color-scheme: dark) {
       html:not(.light) .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
       html:not(.light) .notice { background: #1e293b; border-color: var(--primary); }
       html:not(.light) .button.secondary, html:not(.light) button.secondary { background: #1e293b; color: var(--primary); }
       html:not(.light) .button.secondary:hover, html:not(.light) button.secondary:hover { background: #334155; }
       html:not(.light) input[type=file]:hover, html:not(.light) input[type=file]:focus { background: #334155; border-color: var(--primary); }
-      html:not(.light) tr:hover td { background: #1e293b; }
+      html:not(.light) tr:hover td { background: rgba(129,140,248,0.06); }
+      html:not(.light) .upload-bar-outer, html:not(.light) .disk-bar-outer { background: #334155; }
       html:not(.light) .filter-btn { background: #1e293b; color: var(--primary); }
       html:not(.light) .tag { background: #1e293b; color: var(--primary); }
       html:not(.light) .toast { background: #e2e8f0; color: #0f172a; }
@@ -1430,28 +1430,57 @@ class DownloadHandler(BaseHTTPRequestHandler):
         if "multipart/form-data" not in content_type:
             self.send_error_page(400, "请使用 multipart/form-data 表单上传")
             return
-        try:
-            form = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
-            )
-        except Exception:
-            self.send_error_page(400, "表单解析失败")
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0:
+            self.send_error_page(400, "缺少 Content-Length")
             return
-        password = form.getfirst("password", "")
+        m = re.search(r'boundary=([^\s;]+)', content_type)
+        if not m:
+            self.send_error_page(400, "缺少 boundary")
+            return
+        boundary = m.group(1).encode("ascii")
+        sep = b"--" + boundary
+
+        raw = self.rfile.read(content_length)
+
+        fields: dict[str, str] = {}
+        file_data: bytes | None = None
+        file_orig_name: str = ""
+
+        parts = raw.split(sep)
+        for part in parts:
+            part = part.strip(b"\r\n")
+            if not part or part == b"--":
+                continue
+            if b"\r\n\r\n" not in part:
+                continue
+            header_block, body = part.split(b"\r\n\r\n", 1)
+            if body.endswith(b"\r\n"):
+                body = body[:-2]
+            header_text = header_block.decode("utf-8", errors="replace")
+            disp_match = re.search(r'name="([^"]+)"', header_text)
+            if not disp_match:
+                continue
+            field_name = disp_match.group(1)
+            fname_match = re.search(r'filename="([^"]*)"', header_text)
+            if fname_match and fname_match.group(1):
+                file_data = body
+                file_orig_name = fname_match.group(1)
+            else:
+                fields[field_name] = body.decode("utf-8", errors="replace")
+
+        password = fields.get("password", "")
         if not check_admin_password(password):
             self.send_error_page(403, "管理密码错误")
             return
-        file_field = form["file"] if "file" in form else None
-        if file_field is None or not hasattr(file_field, "file") or not file_field.filename:
+        if file_data is None or not file_orig_name:
             self.send_error_page(400, "请选择要上传的文件")
             return
-        custom_name = (form.getfirst("filename", "") or "").strip()
-        filename = custom_name if custom_name else file_field.filename
-        retention = int(form.getfirst("retention", "0") or "0")
+        custom_name = fields.get("filename", "").strip()
+        filename = custom_name if custom_name else file_orig_name
+        retention = int(fields.get("retention", "0") or "0")
         try:
-            written = save_uploaded_file(filename, file_field.file, retention)
+            written = save_uploaded_file(filename, io.BytesIO(file_data), retention)
         except FileExistsError as exc:
             self.send_error_page(409, str(exc))
             return
