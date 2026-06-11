@@ -798,7 +798,11 @@ def page(title: str, body: str) -> bytes:
       var status = document.getElementById('upload-status');
       var outer = document.getElementById('upload-progress');
       var btn = form.querySelector('input[type=submit]');
-      var fd = new FormData(form);
+      var fd = new FormData();
+      fd.append('password', form.querySelector('[name=password]').value);
+      fd.append('filename', (form.querySelector('[name=filename]') || {}).value || '');
+      fd.append('retention', (form.querySelector('[name=retention]') || {}).value || '0');
+      fd.append('file', form.querySelector('[name=file]').files[0]);
       var xhr = new XMLHttpRequest();
       outer.classList.add('active');
       btn.disabled = true;
@@ -1426,6 +1430,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
         self.send_bytes(200, success_page("续命成功", f"{filename} 的保留时间已重置。"))
 
     def handle_upload(self) -> None:
+        """Streaming multipart upload — never buffers the full file in memory."""
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
             self.send_error_page(400, "请使用 multipart/form-data 表单上传")
@@ -1434,61 +1439,159 @@ class DownloadHandler(BaseHTTPRequestHandler):
         if content_length <= 0:
             self.send_error_page(400, "缺少 Content-Length")
             return
-        m = re.search(r'boundary=([^\s;]+)', content_type)
-        if not m:
+        bm = re.search(r'boundary=([^\s;]+)', content_type)
+        if not bm:
             self.send_error_page(400, "缺少 boundary")
             return
-        boundary = m.group(1).encode("ascii")
-        sep = b"--" + boundary
+        boundary = bm.group(1).encode("ascii")
+        delim = b"--" + boundary
 
-        raw = self.rfile.read(content_length)
+        consumed = 0
+
+        def _readline():
+            nonlocal consumed
+            line = self.rfile.readline(65536)
+            consumed += len(line)
+            return line
+
+        def _read(n):
+            nonlocal consumed
+            data = self.rfile.read(n)
+            consumed += len(data)
+            return data
+
+        def _drain():
+            nonlocal consumed
+            left = content_length - consumed
+            while left > 0:
+                chunk = self.rfile.read(min(65536, left))
+                if not chunk:
+                    break
+                consumed += len(chunk)
+                left -= len(chunk)
 
         fields: dict[str, str] = {}
-        file_data: bytes | None = None
-        file_orig_name: str = ""
+        file_orig_name = ""
+        tmp_path: Path | None = None
+        written = 0
 
-        parts = raw.split(sep)
-        for part in parts:
-            part = part.strip(b"\r\n")
-            if not part or part == b"--":
-                continue
-            if b"\r\n\r\n" not in part:
-                continue
-            header_block, body = part.split(b"\r\n\r\n", 1)
-            if body.endswith(b"\r\n"):
-                body = body[:-2]
-            header_text = header_block.decode("utf-8", errors="replace")
-            disp_match = re.search(r'name="([^"]+)"', header_text)
-            if not disp_match:
-                continue
-            field_name = disp_match.group(1)
-            fname_match = re.search(r'filename="([^"]*)"', header_text)
-            if fname_match and fname_match.group(1):
-                file_data = body
-                file_orig_name = fname_match.group(1)
-            else:
-                fields[field_name] = body.decode("utf-8", errors="replace")
-
-        password = fields.get("password", "")
-        if not check_admin_password(password):
-            self.send_error_page(403, "管理密码错误")
-            return
-        if file_data is None or not file_orig_name:
-            self.send_error_page(400, "请选择要上传的文件")
-            return
-        custom_name = fields.get("filename", "").strip()
-        filename = custom_name if custom_name else file_orig_name
-        retention = int(fields.get("retention", "0") or "0")
         try:
-            written = save_uploaded_file(filename, io.BytesIO(file_data), retention)
+            # Read initial boundary line: --boundary\r\n
+            _readline()
+
+            while consumed < content_length:
+                # ---- Read part headers until blank line ----
+                headers_raw = b""
+                while True:
+                    line = _readline()
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+                    headers_raw += line
+                if not headers_raw:
+                    break
+
+                header_text = headers_raw.decode("utf-8", errors="replace")
+                name_match = re.search(r'name="([^"]+)"', header_text)
+                if not name_match:
+                    break
+                fname_match = re.search(r'filename="([^"]*)"', header_text)
+
+                if fname_match and fname_match.group(1):
+                    # ---- FILE PART: stream body to disk ----
+                    file_orig_name = fname_match.group(1)
+                    file_remaining = content_length - consumed
+                    closing = b"\r\n" + delim + b"--"
+                    tail_reserve = len(closing) + 4
+
+                    tmp_path = DOWNLOADS_DIR / f".upload-{secrets.token_hex(8)}.tmp"
+                    tail_buf = b""
+                    with tmp_path.open("wb") as out:
+                        while file_remaining > 0:
+                            to_read = min(1048576, file_remaining)
+                            chunk = _read(to_read)
+                            if not chunk:
+                                break
+                            file_remaining = content_length - consumed
+                            data = tail_buf + chunk
+                            if file_remaining > 0:
+                                if len(data) > tail_reserve:
+                                    to_write = data[:-tail_reserve]
+                                    out.write(to_write)
+                                    written += len(to_write)
+                                    tail_buf = data[-tail_reserve:]
+                                else:
+                                    tail_buf = data
+                            else:
+                                idx = data.rfind(b"\r\n" + delim)
+                                if idx >= 0:
+                                    data = data[:idx]
+                                out.write(data)
+                                written += len(data)
+                    break  # file part is last (JS sends it last)
+
+                else:
+                    # ---- TEXT FIELD: read until next boundary line ----
+                    field_lines: list[bytes] = []
+                    while consumed < content_length:
+                        line = _readline()
+                        stripped = line.rstrip(b"\r\n")
+                        if stripped == delim or stripped == delim + b"--":
+                            break
+                        field_lines.append(line)
+                    val = b"".join(field_lines)
+                    if val.endswith(b"\r\n"):
+                        val = val[:-2]
+                    fields[name_match.group(1)] = val.decode("utf-8", errors="replace")
+
+            # ---- Validate & finalise ----
+            password = fields.get("password", "")
+            if not check_admin_password(password):
+                self.send_error_page(403, "管理密码错误")
+                return
+            if tmp_path is None or not file_orig_name:
+                self.send_error_page(400, "请选择要上传的文件")
+                return
+
+            custom_name = fields.get("filename", "").strip()
+            filename = custom_name if custom_name else file_orig_name
+            retention = int(fields.get("retention", "0") or "0")
+
+            name = validate_custom_filename(filename)
+            target = (DOWNLOADS_DIR / name).resolve()
+            target.relative_to(DOWNLOADS_DIR)
+            if target.exists():
+                raise FileExistsError("同名文件已存在，已拒绝覆盖")
+
+            ensure_can_store_new_file()
+            budget = MAX_DOWNLOAD_DIR_BYTES - get_downloads_usage()
+            if written > SINGLE_FILE_LIMIT_BYTES:
+                raise RuntimeError(f"上传文件超过单文件限制 {format_size(SINGLE_FILE_LIMIT_BYTES)}")
+            if written > budget:
+                raise RuntimeError(f"downloads 目录将超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}")
+
+            tmp_path.replace(target)
+            tmp_path = None  # prevent cleanup
+
+            meta = load_meta()
+            entry: dict[str, float] = {"created_at": now_ts()}
+            if retention and retention in RETENTION_OPTIONS_SET:
+                entry["retention_seconds"] = float(retention)
+            meta[name] = entry
+            save_meta(meta)
+            append_log("upload.log", f"uploaded name={name} size={written}")
+            self.send_bytes(200, success_page("上传成功", f"文件 {name}（{format_size(written)}）已保存"))
+
         except FileExistsError as exc:
             self.send_error_page(409, str(exc))
-            return
         except (ValueError, RuntimeError) as exc:
             self.send_error_page(400, f"上传失败：{exc}")
-            return
-        safe_name = validate_custom_filename(filename)
-        self.send_bytes(200, success_page("上传成功", f"文件 {safe_name}（{format_size(written)}）已保存"))
+        except Exception:
+            append_log("error.log", traceback.format_exc())
+            self.send_error_page(500, "上传处理异常")
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
 
     def handle_file(self, encoded_name: str, head_only: bool) -> None:
         try:
