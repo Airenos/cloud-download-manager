@@ -796,52 +796,76 @@ def page(title: str, body: str) -> bytes:
       var url = new URL(path, window.location.href).href;
       navigator.clipboard.writeText(url).then(function(){ showToast('\u94fe\u63a5\u5df2\u590d\u5236'); });
     }
-    function handleUpload(form) {
+    async function handleUpload(form) {
       var bar = document.getElementById('upload-bar');
       var status = document.getElementById('upload-status');
       var outer = document.getElementById('upload-progress');
       var btn = form.querySelector('input[type=submit]');
-      var fd = new FormData();
-      fd.append('password', form.querySelector('[name=password]').value);
-      fd.append('filename', (form.querySelector('[name=filename]') || {}).value || '');
-      fd.append('retention', (form.querySelector('[name=retention]') || {}).value || '0');
-      fd.append('file', form.querySelector('[name=file]').files[0]);
-      var xhr = new XMLHttpRequest();
+      var fileInput = form.querySelector('[name=file]');
+      var file = fileInput.files[0];
+      if (!file) return false;
+      var password = form.querySelector('[name=password]').value;
+      var customName = (form.querySelector('[name=filename]') || {}).value || '';
+      var retention = (form.querySelector('[name=retention]') || {}).value || '0';
       outer.classList.add('active');
       btn.disabled = true;
       btn.value = '\u4e0a\u4f20\u4e2d...';
-      xhr.upload.onprogress = function(e) {
-        if (e.lengthComputable) {
-          var pct = Math.round(e.loaded / e.total * 100);
-          bar.style.width = pct + '%';
-          var loaded = (e.loaded / 1048576).toFixed(1);
-          var total = (e.total / 1048576).toFixed(1);
-          status.textContent = pct + '% \u00b7 ' + loaded + ' / ' + total + ' MB';
-        }
-      };
-      xhr.onload = function() {
-        if (xhr.status === 200) {
-          bar.style.width = '100%';
-          status.textContent = '\u4e0a\u4f20\u5b8c\u6210\uff01\u6b63\u5728\u8df3\u8f6c...';
-          setTimeout(function(){ window.location.href = '/downloads/'; }, 800);
-        } else {
+      
+      var chunkSize = 5 * 1024 * 1024;
+      var totalChunks = Math.ceil(file.size / chunkSize);
+      var uploadId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+      var uploadedBytes = 0;
+      
+      for (var i = 0; i < totalChunks; i++) {
+        var start = i * chunkSize;
+        var end = Math.min(start + chunkSize, file.size);
+        var chunk = file.slice(start, end);
+        try {
+          await new Promise(function(resolve, reject) {
+            var xhr = new XMLHttpRequest();
+            xhr.upload.onprogress = function(e) {
+              if (e.lengthComputable) {
+                var currentLoaded = uploadedBytes + e.loaded;
+                var pct = Math.round(currentLoaded / file.size * 100);
+                bar.style.width = pct + '%';
+                var loadedMB = (currentLoaded / 1048576).toFixed(1);
+                var totalMB = (file.size / 1048576).toFixed(1);
+                status.textContent = pct + '% \u00b7 ' + loadedMB + ' / ' + totalMB + ' MB (' + (i+1) + '/' + totalChunks + ')';
+              }
+            };
+            xhr.onload = function() {
+              if (xhr.status === 200) { resolve(); }
+              else { reject(xhr); }
+            };
+            xhr.onerror = function() { reject(xhr); };
+            xhr.open('POST', '/api/upload_chunk');
+            xhr.setRequestHeader('X-Upload-Id', uploadId);
+            xhr.setRequestHeader('X-Chunk-Index', i);
+            xhr.setRequestHeader('X-Total-Chunks', totalChunks);
+            xhr.setRequestHeader('X-Password', encodeURIComponent(password));
+            if (i === totalChunks - 1) {
+              xhr.setRequestHeader('X-Filename', encodeURIComponent(customName));
+              xhr.setRequestHeader('X-Retention', retention);
+              xhr.setRequestHeader('X-Orig-Filename', encodeURIComponent(file.name));
+            }
+            xhr.send(chunk);
+          });
+          uploadedBytes += chunk.size;
+        } catch (xhr) {
           var msg = '\u4e0a\u4f20\u5931\u8d25';
           try {
-            var m = xhr.responseText.match(/<p>([^<]+)<\\/p>/);
+            var m = xhr.responseText && xhr.responseText.match(/<p>([^<]+)<\\/p>/);
             if (m) msg = m[1];
           } catch(e) {}
           status.textContent = msg;
           btn.disabled = false;
           btn.value = '\u91cd\u8bd5\u4e0a\u4f20';
+          return false;
         }
-      };
-      xhr.onerror = function() {
-        status.textContent = '\u7f51\u7edc\u9519\u8bef\uff0c\u8bf7\u91cd\u8bd5';
-        btn.disabled = false;
-        btn.value = '\u91cd\u8bd5\u4e0a\u4f20';
-      };
-      xhr.open('POST', '/api/upload');
-      xhr.send(fd);
+      }
+      bar.style.width = '100%';
+      status.textContent = '\u4e0a\u4f20\u5b8c\u6210\uff01\u6b63\u5728\u8df3\u8f6c...';
+      setTimeout(function(){ window.location.href = '/downloads/'; }, 800);
       return false;
     }
     (function() {
@@ -1370,6 +1394,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
         if raw_path == "/api/upload":
             self.handle_upload()
             return
+        if raw_path == "/api/upload_chunk":
+            self.handle_upload_chunk()
+            return
         form = parse_form(self)
         if raw_path == "/api/add-task":
             self.handle_add_task(form)
@@ -1600,6 +1627,89 @@ class DownloadHandler(BaseHTTPRequestHandler):
             if tmp_path is not None:
                 with contextlib.suppress(OSError):
                     tmp_path.unlink()
+
+    def handle_upload_chunk(self) -> None:
+        try:
+            upload_id = self.headers.get("X-Upload-Id", "")
+            chunk_index = int(self.headers.get("X-Chunk-Index", "-1"))
+            total_chunks = int(self.headers.get("X-Total-Chunks", "-1"))
+            password = urllib.parse.unquote(self.headers.get("X-Password", ""))
+            
+            if not check_admin_password(password):
+                self.send_error_page(403, "管理密码错误")
+                return
+                
+            if not upload_id.isalnum() or chunk_index < 0 or total_chunks <= 0 or chunk_index >= total_chunks:
+                self.send_error_page(400, "分片参数错误")
+                return
+                
+            ensure_can_store_new_file()
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length > 10 * 1024 * 1024:
+                self.send_error_page(413, "单分片过大")
+                return
+                
+            tmp_path = DOWNLOADS_DIR / f".upload-{upload_id}.tmp"
+            
+            body = self.rfile.read(content_length)
+            if len(body) != content_length:
+                self.send_error_page(400, "网络中断导致数据不完整")
+                return
+                
+            with tmp_path.open("ab") as out:
+                out.write(body)
+                
+            if tmp_path.stat().st_size > SINGLE_FILE_LIMIT_BYTES:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+                self.send_error_page(400, f"文件超过上限 {format_size(SINGLE_FILE_LIMIT_BYTES)}")
+                return
+                
+            if chunk_index == total_chunks - 1:
+                orig_name = urllib.parse.unquote(self.headers.get("X-Orig-Filename", ""))
+                custom_name = urllib.parse.unquote(self.headers.get("X-Filename", ""))
+                retention = int(self.headers.get("X-Retention", "0"))
+                
+                filename = custom_name if custom_name else orig_name
+                if not filename:
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+                    self.send_error_page(400, "缺少文件名")
+                    return
+                    
+                name = validate_custom_filename(filename)
+                target = (DOWNLOADS_DIR / name).resolve()
+                
+                if target.exists():
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+                    raise FileExistsError("同名文件已存在，已拒绝覆盖")
+                    
+                budget = MAX_DOWNLOAD_DIR_BYTES - get_downloads_usage()
+                if tmp_path.stat().st_size > budget:
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+                    raise RuntimeError("磁盘空间不足")
+                    
+                tmp_path.replace(target)
+                
+                meta = load_meta()
+                entry: dict[str, float] = {"created_at": now_ts()}
+                if retention and retention in RETENTION_OPTIONS_SET:
+                    entry["retention_seconds"] = float(retention)
+                meta[name] = entry
+                save_meta(meta)
+                append_log("upload.log", f"uploaded name={name} size={target.stat().st_size}")
+                
+            self.send_bytes(200, b"OK")
+            
+        except FileExistsError as exc:
+            self.send_error_page(409, str(exc))
+        except (ValueError, RuntimeError) as exc:
+            self.send_error_page(400, f"上传失败：{exc}")
+        except Exception:
+            append_log("error.log", traceback.format_exc())
+            self.send_error_page(500, "上传分片处理异常")
 
     def handle_file(self, encoded_name: str, head_only: bool) -> None:
         try:
