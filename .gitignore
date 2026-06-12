@@ -15,3 +15,11 @@ aria2.session
 *.aria2
 __pycache__/
 *.py[cod]
+
+# Test and temp files
+/test.bin
+/scratch_*.js
+/test_upload.py
+*.tmp
+*.tmp.part*
+/plan/

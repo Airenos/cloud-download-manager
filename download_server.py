@@ -23,10 +23,10 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-
+import threading
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", Path(__file__).resolve().parent)).resolve()
+META_LOCK = threading.RLock()
 DOWNLOADS_DIR = (APP_ROOT / "downloads").resolve()
 LOGS_DIR = (APP_ROOT / "logs").resolve()
 DATA_DIR = (APP_ROOT / "data").resolve()
@@ -220,22 +220,23 @@ def is_visible_download(path: Path) -> bool:
 
 def scan_files() -> list[dict[str, object]]:
     ensure_directories()
-    meta = load_meta()
-    changed = False
-    current_files: set[str] = set()
-    for path in DOWNLOADS_DIR.iterdir():
-        if not is_visible_download(path):
-            continue
-        current_files.add(path.name)
-        if path.name not in meta:
-            meta[path.name] = {"created_at": now_ts()}
-            changed = True
-    for stale_name in list(meta.keys()):
-        if stale_name not in current_files:
-            meta.pop(stale_name, None)
-            changed = True
-    if changed:
-        save_meta(meta)
+    with META_LOCK:
+        meta = load_meta()
+        changed = False
+        current_files: set[str] = set()
+        for path in DOWNLOADS_DIR.iterdir():
+            if not is_visible_download(path):
+                continue
+            current_files.add(path.name)
+            if path.name not in meta:
+                meta[path.name] = {"created_at": now_ts()}
+                changed = True
+        for stale_name in list(meta.keys()):
+            if stale_name not in current_files:
+                meta.pop(stale_name, None)
+                changed = True
+        if changed:
+            save_meta(meta)
     files = []
     for name in sorted(current_files, key=str.casefold):
         path = DOWNLOADS_DIR / name
@@ -270,51 +271,53 @@ def append_log(log_name: str, message: str) -> None:
 
 def cleanup_expired() -> list[str]:
     ensure_directories()
-    meta = load_meta()
     now = now_ts()
     removed: list[str] = []
-    changed = False
-    for name, item in list(meta.items()):
-        path = DOWNLOADS_DIR / name
-        if not path.exists():
-            meta.pop(name, None)
-            changed = True
-            continue
-        ret_secs = item.get("retention_seconds", RETENTION_SECONDS)
-        created = item.get("created_at", now)
-        if created + ret_secs <= now:
-            with contextlib.suppress(OSError):
-                path.unlink()
-            with contextlib.suppress(OSError):
-                (DOWNLOADS_DIR / f"{name}.aria2").unlink()
-            meta.pop(name, None)
-            removed.append(name)
-            changed = True
-            append_log("cleanup.log", f"expired removed={name}")
-    for f in DOWNLOADS_DIR.glob(".upload-*.tmp*"):
-        try:
-            if now - f.stat().st_mtime > 86400:
-                f.unlink()
-        except OSError:
-            pass
-    if changed:
-        save_meta(meta)
+    with META_LOCK:
+        meta = load_meta()
+        changed = False
+        for name, item in list(meta.items()):
+            path = DOWNLOADS_DIR / name
+            if not path.exists():
+                meta.pop(name, None)
+                changed = True
+                continue
+            ret_secs = item.get("retention_seconds", RETENTION_SECONDS)
+            created = item.get("created_at", now)
+            if created + ret_secs <= now:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                with contextlib.suppress(OSError):
+                    (DOWNLOADS_DIR / f"{name}.aria2").unlink()
+                meta.pop(name, None)
+                removed.append(name)
+                changed = True
+                append_log("cleanup.log", f"expired removed={name}")
+        for f in DOWNLOADS_DIR.glob(".upload-*.tmp*"):
+            try:
+                if now - f.stat().st_mtime > 86400:
+                    f.unlink()
+            except OSError:
+                pass
+        if changed:
+            save_meta(meta)
     return removed
 
 
 def renew_file(filename: str, password: str) -> None:
     if not check_admin_password(password):
         raise PermissionError("管理密码错误")
-    meta = load_meta()
-    if filename not in meta:
-        raise FileNotFoundError("文件不存在或已过期")
-    path = DOWNLOADS_DIR / filename
-    if not path.exists():
-        meta.pop(filename, None)
+    with META_LOCK:
+        meta = load_meta()
+        if filename not in meta:
+            raise FileNotFoundError("文件不存在或已过期")
+        path = DOWNLOADS_DIR / filename
+        if not path.exists():
+            meta.pop(filename, None)
+            save_meta(meta)
+            raise FileNotFoundError("文件不存在或已过期")
+        meta[filename]["created_at"] = now_ts()
         save_meta(meta)
-        raise FileNotFoundError("文件不存在或已过期")
-    meta[filename]["created_at"] = now_ts()
-    save_meta(meta)
     append_log("renew.log", f"renewed name={filename}")
 
 
@@ -445,12 +448,13 @@ def save_uploaded_file(filename: str, source_file, retention_seconds: int = 0) -
                     raise RuntimeError(f"downloads 目录将超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}，已拒绝上传")
                 out.write(chunk)
         tmp_path.replace(target)
-        meta = load_meta()
-        entry: dict[str, float] = {"created_at": now_ts()}
-        if retention_seconds and retention_seconds in RETENTION_OPTIONS_SET:
-            entry["retention_seconds"] = float(retention_seconds)
-        meta[name] = entry
-        save_meta(meta)
+        with META_LOCK:
+            meta = load_meta()
+            entry: dict[str, float] = {"created_at": now_ts()}
+            if retention_seconds and retention_seconds in RETENTION_OPTIONS_SET:
+                entry["retention_seconds"] = float(retention_seconds)
+            meta[name] = entry
+            save_meta(meta)
         append_log("upload.log", f"uploaded name={name} size={written}")
         return written
     except Exception:
@@ -493,10 +497,11 @@ def add_aria2_task(url: str, filename: str | None = None, retention_seconds: int
     if not isinstance(result, str):
         raise RuntimeError("aria2 未返回 GID")
     if out_name and retention_seconds and retention_seconds in RETENTION_OPTIONS_SET:
-        meta = load_meta()
-        if out_name not in meta:
-            meta[out_name] = {"created_at": now_ts(), "retention_seconds": float(retention_seconds)}
-            save_meta(meta)
+        with META_LOCK:
+            meta = load_meta()
+            if out_name not in meta:
+                meta[out_name] = {"created_at": now_ts(), "retention_seconds": float(retention_seconds)}
+                save_meta(meta)
     return result
 
 
@@ -594,10 +599,11 @@ def stream_once_file(path: Path, write_chunk, chunk_size: int = 1024 * 128) -> N
         if completed:
             with contextlib.suppress(OSError):
                 path.unlink()
-            meta = load_meta()
-            if name in meta:
-                meta.pop(name, None)
-                save_meta(meta)
+            with META_LOCK:
+                meta = load_meta()
+                if name in meta:
+                    meta.pop(name, None)
+                    save_meta(meta)
             append_log("once-download.log", f"completed removed={name}")
         else:
             append_log("once-download.log", f"interrupted kept={name}")
@@ -1015,6 +1021,10 @@ def page(title: str, body: str) -> bytes:
       var m = document.getElementById('share-modal');
       if (m) m.classList.remove('active');
     }
+    document.addEventListener('click', function(e) {
+      var btn = e.target.closest && e.target.closest('.share-btn');
+      if (btn) showShare(btn.dataset.url, btn.dataset.name);
+    });
     """
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
@@ -1069,7 +1079,11 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         ft = str(item.get("file_type", "other"))
         kind = file_kind(name)
         preview = f'<a class="button secondary" href="/view/{url_name}">预览</a> ' if kind else ""
-        share_btn = f'<button class="secondary" type="button" onclick="showShare(\'/file/{url_name}\',\'{html.escape(name, quote=True)}\')">分享</button>'
+        share_btn = (
+            f'<button class="share-btn secondary" type="button" '
+            f'data-url="/file/{url_name}" '
+            f'data-name="{html.escape(name, quote=True)}">分享</button>'
+        )
         ret_label = html.escape(str(item.get("retention_label", "")))
         if compact:
             actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a> {share_btn}'
@@ -1337,9 +1351,10 @@ def parse_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
 
 
 def content_disposition(filename: str, disposition: str = "attachment") -> str:
-    safe_name = filename.replace('"', "'")
+    ext = Path(filename).suffix
+    ascii_fallback = "download" + ext if ext else "download"
     quoted = urllib.parse.quote(filename)
-    return f'{disposition}; filename="{safe_name}"; filename*=UTF-8\'\'{quoted}'
+    return f'{disposition}; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted}'
 
 
 class DownloadHandler(BaseHTTPRequestHandler):
@@ -1663,12 +1678,13 @@ class DownloadHandler(BaseHTTPRequestHandler):
             tmp_path.replace(target)
             tmp_path = None  # prevent cleanup
 
-            meta = load_meta()
-            entry: dict[str, float] = {"created_at": now_ts()}
-            if retention and retention in RETENTION_OPTIONS_SET:
-                entry["retention_seconds"] = float(retention)
-            meta[name] = entry
-            save_meta(meta)
+            with META_LOCK:
+                meta = load_meta()
+                entry: dict[str, float] = {"created_at": now_ts()}
+                if retention and retention in RETENTION_OPTIONS_SET:
+                    entry["retention_seconds"] = float(retention)
+                meta[name] = entry
+                save_meta(meta)
             append_log("upload.log", f"uploaded name={name} size={written}")
             self.send_bytes(200, success_page("上传成功", f"文件 {name}（{format_size(written)}）已保存"))
 
@@ -1694,7 +1710,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 self.send_error_page(403, "管理密码错误")
                 return
                 
-            if not upload_id.isalnum() or chunk_index < 0:
+            if not upload_id.isalnum() or len(upload_id) > 64 or chunk_index < 0:
                 self.send_error_page(400, "分片参数错误")
                 return
                 
@@ -1721,6 +1737,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_error_page(500, "上传分片处理异常")
 
     def handle_upload_finish(self) -> None:
+        upload_id = ""
         try:
             upload_id = self.headers.get("X-Upload-Id", "")
             total_chunks = int(self.headers.get("X-Total-Chunks", "-1"))
@@ -1730,7 +1747,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 self.send_error_page(403, "管理密码错误")
                 return
                 
-            if not upload_id.isalnum() or total_chunks <= 0:
+            if not upload_id.isalnum() or len(upload_id) > 64 or total_chunks <= 0:
                 self.send_error_page(400, "参数错误")
                 return
                 
@@ -1782,12 +1799,13 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 
             tmp_path.replace(target)
             
-            meta = load_meta()
-            entry: dict[str, float] = {"created_at": now_ts()}
-            if retention and retention in RETENTION_OPTIONS_SET:
-                entry["retention_seconds"] = float(retention)
-            meta[name] = entry
-            save_meta(meta)
+            with META_LOCK:
+                meta = load_meta()
+                entry: dict[str, float] = {"created_at": now_ts()}
+                if retention and retention in RETENTION_OPTIONS_SET:
+                    entry["retention_seconds"] = float(retention)
+                meta[name] = entry
+                save_meta(meta)
             append_log("upload.log", f"uploaded name={name} size={target.stat().st_size}")
             
             self.send_bytes(200, b"OK")
