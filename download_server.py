@@ -638,12 +638,15 @@ def copy_file_range(path: Path, output, start: int, length: int, chunk_size: int
     remaining = length
     with path.open("rb") as f:
         f.seek(start)
-        while remaining > 0:
-            chunk = f.read(min(chunk_size, remaining))
-            if not chunk:
-                break
-            output.write(chunk)
-            remaining -= len(chunk)
+        try:
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                output.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
 
 
 def parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
@@ -1263,6 +1266,7 @@ def content_disposition(filename: str, disposition: str = "attachment") -> str:
 
 
 class DownloadHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     server_version = "TempDownloadServer/1.0"
 
     def log_message(self, fmt: str, *args: object) -> None:
