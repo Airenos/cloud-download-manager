@@ -1527,6 +1527,10 @@ class DownloadHandler(BaseHTTPRequestHandler):
                                     data = data[:idx]
                                 out.write(data)
                                 written += len(data)
+                    
+                    if file_remaining > 0:
+                        raise RuntimeError("网络连接异常中断，文件接收不完整")
+                        
                     break  # file part is last (JS sends it last)
 
                 else:
