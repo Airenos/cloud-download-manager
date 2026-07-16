@@ -4,16 +4,16 @@
 
 ## 功能
 
-- 首页 SSR 渲染：统计、文件列表、任务状态、添加任务表单。
-- 下载目录页：预览、普通下载、一次性下载、复制链接、二维码分享。
+- 首页 SSR 渲染：桌面端左侧 64px 管理工具图标栏、右侧文件工作区；移动端改为固定底部工具栏。
+- 文件操作：图片、视频和文本可预览，所有文件可普通下载；更多菜单提供二维码分享、一次性下载和续期。
 - 图片、视频、文本文件在线预览（txt/md/json/log/conf/yaml/xml/csv/py/sh 等）。
 - 自定义保留时间：1小时 / 12小时 / 24小时（默认）/ 3天 / 7天。
 - 一次性下载完整传输成功后删除文件；中断不会删除。
 - 文件类型筛选：全部 / 图片 / 视频 / 文本 / 文档 / 压缩包 / 其他。
-- 深色模式：跟随系统设置自动切换，无需手动操作。
+- 深色模式：跟随系统设置，也可通过页头按钮手动切换。
 - 二维码分享：纯前端 JS 生成，不依赖外部库或 CDN。
 - aria2 RPC 只访问 `127.0.0.1:6800`，secret 不暴露在 HTML。
-- 管理员上传本地文件（带进度条），需要管理密码验证。
+- 管理员分片上传本地文件：服务端上传会话、失败重试、取消、进度显示和过期清理。
 
 仅用于合法资源临时中转，请勿下载或传播侵权内容。
 
@@ -34,7 +34,8 @@
 ├── logs/
 │   └── .gitkeep
 ├── data/
-│   └── .gitkeep
+│   ├── .gitkeep
+│   └── uploads/            # 运行时上传会话 JSON
 └── tests/
     └── test_download_server.py
 ```
@@ -94,12 +95,16 @@ cat data/admin_password.txt
 ## 使用
 
 1. 打开首页。
-2. 展开“添加下载任务”。
+2. 点击桌面端左侧或移动端底部的“添加链接”图标，在页面中央弹窗中操作。
 3. 输入 HTTP/HTTPS 链接、自定义文件名（可选）和管理密码。
 4. 提交后等待 aria2 下载完成。
-5. 打开 `/downloads/` 下载文件。
+5. 在文件工作区预览或下载文件。视频行同时保留“预览”和“下载”。
 
-也可以展开“上传本地文件”，选择文件并输入管理密码直接上传。
+二维码分享、一次性下载和续期位于每个文件的“更多”菜单。也可以点击“上传文件”图标，在中央弹窗中选择文件并输入管理密码直接上传。浏览器先向服务端创建上传会话，再按服务端返回的分片大小和并发数上传；每个分片直接写入同一个临时文件的目标 offset，完成阶段只校验并 rename，不再把所有 `.partN` 文件重新合并一遍。
+
+网络波动时单个分片最多重试两次；上传过程中可以取消。浏览器关闭或断网后，未完成会话会在 TTL 到期后由清理流程删除。这个实现减少了 finish 等待和磁盘写放大，但不能突破公网、反代或隧道的真实带宽。
+
+禁用 JavaScript 时仍可使用传统 multipart 上传，但默认只允许不超过 50MiB 的请求。对于数百 MiB 或更大的文件，优先使用浏览器分片上传；服务器本机已有文件时，最快也最稳定的方式仍是使用 `scp`/`rsync` 直接写入 `downloads/`。
 
 真实下载地址：
 
@@ -149,6 +154,10 @@ MIN_FREE_BYTES=2147483648
 MAX_DOWNLOAD_DIR_BYTES=12884901888
 SINGLE_FILE_LIMIT_BYTES=4294967296
 ARIA2_RPC_TIMEOUT=3
+UPLOAD_CHUNK_BYTES=5242880
+UPLOAD_CONCURRENCY=3
+UPLOAD_SESSION_TTL_SECONDS=21600
+UPLOAD_FALLBACK_MAX_BYTES=52428800
 ```
 
 说明：
@@ -157,6 +166,10 @@ ARIA2_RPC_TIMEOUT=3
 - `downloads/` 占用超过 `MAX_DOWNLOAD_DIR_BYTES` 时拒绝新任务。
 - HTTP/HTTPS 远程文件如果能通过 `Content-Length` 预先得知大小，超过 `SINGLE_FILE_LIMIT_BYTES` 会拒绝；如果远端不提供大小，只能下载过程中依赖磁盘空间保护。
 - `RETENTION_HOURS` 控制文件保留时间。
+- `UPLOAD_CHUNK_BYTES` 是浏览器分片大小，默认 5MiB。
+- `UPLOAD_CONCURRENCY` 是浏览器并发 worker 数，默认 3；隧道不稳定时可降为 1 或 2。
+- `UPLOAD_SESSION_TTL_SECONDS` 是未完成上传的保留时间，默认 6 小时。
+- `UPLOAD_FALLBACK_MAX_BYTES` 是传统 multipart 上传上限，默认 50MiB。
 
 ## 清理
 
@@ -184,6 +197,18 @@ logs/cleanup.log
 logs/once-download.log
 ```
 
+上传诊断日志写入：
+
+```text
+logs/upload.log
+```
+
+典型分片记录包含 `read_ms`、`write_ms` 和 `total_ms`：
+
+- `read_ms` 高：瓶颈通常在浏览器、反向代理或隧道到 Python 的网络读取。
+- `write_ms` 高：瓶颈通常在服务器磁盘写入。
+- finish 的 `rename_ms` 应很低；若 finish 仍慢，应检查文件系统或元数据写入错误日志。
+
 ## aria2 配置
 
 `aria2.conf.example` 只是模板，不包含真实 secret。`start.sh` 会：
@@ -197,7 +222,8 @@ logs/once-download.log
 ## 安全边界
 
 - 不暴露项目根目录。
-- 上传接口需要管理密码验证，同名文件拒绝覆盖。
+- 上传初始化需要管理密码验证；后续分片使用服务端生成的短期 ID/token，同名文件拒绝覆盖。
+- 上传 ID 只用于派生 `data/uploads/` 和 `downloads/.upload-*.tmp` 下的路径，客户端不能提交任意文件路径。
 - 不访问 `downloads/` 之外的文件。
 - 拒绝路径穿越和 URL 编码绕过。
 - 预览路由同样只允许访问 `downloads/` 内的图片/视频文件。

@@ -31,6 +31,7 @@ DOWNLOADS_DIR = (APP_ROOT / "downloads").resolve()
 LOGS_DIR = (APP_ROOT / "logs").resolve()
 DATA_DIR = (APP_ROOT / "data").resolve()
 META_PATH = DATA_DIR / "filemeta.json"
+UPLOADS_DIR = (DATA_DIR / "uploads").resolve()
 ADMIN_PASSWORD_PATH = DATA_DIR / "admin_password.txt"
 ARIA2_SECRET_PATH = DATA_DIR / "aria2_rpc_secret.txt"
 ARIA2_RPC_URL = os.environ.get("ARIA2_RPC_URL", "http://127.0.0.1:6800/jsonrpc")
@@ -43,6 +44,14 @@ RETENTION_SECONDS = int(RETENTION_HOURS * 3600)
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(2 * 1024**3)))
 MAX_DOWNLOAD_DIR_BYTES = int(os.environ.get("MAX_DOWNLOAD_DIR_BYTES", str(12 * 1024**3)))
 SINGLE_FILE_LIMIT_BYTES = int(os.environ.get("SINGLE_FILE_LIMIT_BYTES", str(4 * 1024**3)))
+UPLOAD_CHUNK_BYTES = int(os.environ.get("UPLOAD_CHUNK_BYTES", str(5 * 1024**2)))
+UPLOAD_CONCURRENCY = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
+UPLOAD_SESSION_TTL_SECONDS = int(os.environ.get("UPLOAD_SESSION_TTL_SECONDS", "21600"))
+UPLOAD_FALLBACK_MAX_BYTES = int(
+    os.environ.get("UPLOAD_FALLBACK_MAX_BYTES", str(50 * 1024**2))
+)
+UPLOAD_LOCKS: dict[str, threading.RLock] = {}
+UPLOAD_LOCKS_GUARD = threading.Lock()
 TIMEZONE_CN = timezone(timedelta(hours=8))
 
 ALLOWED_URL_PREFIXES = ("http://", "https://")
@@ -76,7 +85,7 @@ BANNED_PREFIXES = (
 
 
 def ensure_directories() -> None:
-    for directory in (DOWNLOADS_DIR, LOGS_DIR, DATA_DIR):
+    for directory in (DOWNLOADS_DIR, LOGS_DIR, DATA_DIR, UPLOADS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -157,6 +166,45 @@ def get_downloads_usage() -> int:
     return total
 
 
+def get_upload_tmp_usage() -> int:
+    total = 0
+    if not DOWNLOADS_DIR.exists():
+        return 0
+    for path in DOWNLOADS_DIR.glob(".upload-*.tmp"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def get_active_upload_reserved_bytes() -> int:
+    total = 0
+    if not UPLOADS_DIR.exists():
+        return 0
+    for path in UPLOADS_DIR.glob("*.json"):
+        try:
+            session = load_upload_session(path.stem)
+            tmp_path = upload_tmp_path(path.stem)
+            current_size = tmp_path.stat().st_size if tmp_path.exists() else 0
+            total += max(0, int(session["size"]) - current_size)
+        except (OSError, TypeError, ValueError):
+            continue
+    return total
+
+
+def ensure_upload_capacity(size: int) -> None:
+    ensure_can_store_new_file()
+    reserved = get_active_upload_reserved_bytes()
+    projected = get_downloads_usage() + get_upload_tmp_usage() + reserved + size
+    if projected > MAX_DOWNLOAD_DIR_BYTES:
+        raise RuntimeError(f"downloads 目录将超过 {format_size(MAX_DOWNLOAD_DIR_BYTES)}")
+    free_after_reservations = shutil.disk_usage(DOWNLOADS_DIR).free - MIN_FREE_BYTES - reserved
+    if size > free_after_reservations:
+        raise RuntimeError("磁盘剩余空间不足")
+
+
 def get_disk_stats() -> dict[str, object]:
     ensure_directories()
     usage = shutil.disk_usage(DOWNLOADS_DIR)
@@ -206,6 +254,158 @@ def save_meta(meta: dict[str, dict[str, float]]) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2, sort_keys=True)
     tmp_path.replace(META_PATH)
+
+
+def validate_upload_id(upload_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", upload_id or ""):
+        raise ValueError("上传任务 ID 无效")
+    return upload_id
+
+
+def upload_session_path(upload_id: str) -> Path:
+    return UPLOADS_DIR / f"{validate_upload_id(upload_id)}.json"
+
+
+def upload_tmp_path(upload_id: str) -> Path:
+    return DOWNLOADS_DIR / f".upload-{validate_upload_id(upload_id)}.tmp"
+
+
+def get_upload_lock(upload_id: str) -> threading.RLock:
+    upload_id = validate_upload_id(upload_id)
+    with UPLOAD_LOCKS_GUARD:
+        return UPLOAD_LOCKS.setdefault(upload_id, threading.RLock())
+
+
+def load_upload_session(upload_id: str) -> dict[str, object]:
+    path = upload_session_path(upload_id)
+    if not path.exists():
+        raise FileNotFoundError("上传任务不存在")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("上传任务状态损坏") from exc
+    required = {
+        "upload_id",
+        "upload_token",
+        "filename",
+        "size",
+        "chunk_size",
+        "total_chunks",
+        "retention_seconds",
+        "created_at",
+        "updated_at",
+        "received_chunks",
+        "received_bytes",
+    }
+    if not isinstance(data, dict) or not required.issubset(data):
+        raise ValueError("上传任务状态损坏")
+    integer_fields = ("size", "chunk_size", "total_chunks", "retention_seconds", "received_bytes")
+    if any(type(data[field]) is not int for field in integer_fields):
+        raise ValueError("上传任务状态损坏")
+    if any(
+        not isinstance(data[field], (int, float)) or isinstance(data[field], bool)
+        for field in ("created_at", "updated_at")
+    ):
+        raise ValueError("上传任务状态损坏")
+    if (
+        data["upload_id"] != upload_id
+        or not isinstance(data["upload_token"], str)
+        or not data["upload_token"]
+        or not isinstance(data["filename"], str)
+        or not isinstance(data["received_chunks"], list)
+    ):
+        raise ValueError("上传任务状态损坏")
+    validate_custom_filename(data["filename"])
+    size = data["size"]
+    chunk_size = data["chunk_size"]
+    total_chunks = data["total_chunks"]
+    if size <= 0 or chunk_size <= 0 or total_chunks != (size + chunk_size - 1) // chunk_size:
+        raise ValueError("上传任务状态损坏")
+    received = data["received_chunks"]
+    if any(type(index) is not int or index < 0 or index >= total_chunks for index in received):
+        raise ValueError("上传任务状态损坏")
+    if len(received) != len(set(received)):
+        raise ValueError("上传任务状态损坏")
+    expected_received_bytes = sum(
+        min(chunk_size, size - index * chunk_size) for index in received
+    )
+    if data["received_bytes"] != expected_received_bytes:
+        raise ValueError("上传任务状态损坏")
+    return data
+
+
+def save_upload_session(session: dict[str, object]) -> None:
+    ensure_directories()
+    path = upload_session_path(str(session["upload_id"]))
+    tmp_path = path.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(session, f, ensure_ascii=False, indent=2, sort_keys=True)
+    tmp_path.replace(path)
+    chmod_600(path)
+
+
+def remove_upload_session(upload_id: str, remove_tmp: bool = True) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        upload_session_path(upload_id).unlink()
+    if remove_tmp:
+        with contextlib.suppress(FileNotFoundError):
+            upload_tmp_path(upload_id).unlink()
+
+
+def cleanup_upload_sessions(now: float | None = None) -> list[str]:
+    ensure_directories()
+    current = now_ts() if now is None else now
+    removed: list[str] = []
+    for path in UPLOADS_DIR.glob("*.json"):
+        upload_id = path.stem
+        try:
+            validate_upload_id(upload_id)
+            lock = get_upload_lock(upload_id)
+            with lock:
+                session = load_upload_session(upload_id)
+                if current - float(session["updated_at"]) <= UPLOAD_SESSION_TTL_SECONDS:
+                    continue
+                remove_upload_session(upload_id)
+            with UPLOAD_LOCKS_GUARD:
+                UPLOAD_LOCKS.pop(upload_id, None)
+            removed.append(upload_id)
+            append_log("upload.log", f"event=cleanup upload_id={upload_id} reason=expired")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            continue
+    return removed
+
+
+def create_upload_session(
+    filename: str,
+    size: int,
+    chunk_size: int,
+    retention_seconds: int,
+) -> dict[str, object]:
+    ensure_directories()
+    upload_id = secrets.token_urlsafe(18)
+    now = now_ts()
+    session: dict[str, object] = {
+        "upload_id": upload_id,
+        "upload_token": secrets.token_urlsafe(24),
+        "filename": filename,
+        "size": size,
+        "chunk_size": chunk_size,
+        "total_chunks": (size + chunk_size - 1) // chunk_size,
+        "retention_seconds": retention_seconds,
+        "created_at": now,
+        "updated_at": now,
+        "received_chunks": [],
+        "received_bytes": 0,
+    }
+    tmp_path = upload_tmp_path(upload_id)
+    tmp_path.touch(exist_ok=False)
+    try:
+        save_upload_session(session)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        raise
+    return session
 
 
 def is_visible_download(path: Path) -> bool:
@@ -273,6 +473,7 @@ def cleanup_expired() -> list[str]:
     ensure_directories()
     now = now_ts()
     removed: list[str] = []
+    cleanup_upload_sessions(now)
     with META_LOCK:
         meta = load_meta()
         changed = False
@@ -293,9 +494,9 @@ def cleanup_expired() -> list[str]:
                 removed.append(name)
                 changed = True
                 append_log("cleanup.log", f"expired removed={name}")
-        for f in DOWNLOADS_DIR.glob(".upload-*.tmp*"):
+        for f in DOWNLOADS_DIR.glob(".upload-*.tmp.part*"):
             try:
-                if now - f.stat().st_mtime > 86400:
+                if now - f.stat().st_mtime > UPLOAD_SESSION_TTL_SECONDS:
                     f.unlink()
             except OSError:
                 pass
@@ -690,7 +891,7 @@ QR_JS = (Path(__file__).resolve().parent / "qr.js").read_text(encoding="utf-8") 
 
 def page(title: str, body: str) -> bytes:
     css = """
-    :root { color-scheme: light; --primary: #6d5dfc; --primary-dark: #5144d8; --bg: #f6f7fb; --text: #1f2430; --muted: #6b7280; --line: #e5e7eb; --card-bg: #fff; --input-bg: #fff; --input-border: #e5e7eb; --file-bg: #fafaff; }
+    :root { color-scheme: light; --primary: #1769aa; --primary-dark: #0f548c; --bg: #f3f5f7; --text: #18212b; --muted: #64707d; --line: #dce1e6; --card-bg: #fff; --input-bg: #fff; --input-border: #cbd3db; --file-bg: #f8fafb; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
     main { width: min(1100px, calc(100% - 28px)); margin: 0 auto; padding: 28px 0 48px; }
@@ -703,13 +904,13 @@ def page(title: str, body: str) -> bytes:
     .button, button, input[type=submit] { border: 0; border-radius: 8px; background: var(--primary); color: #fff; padding: 9px 13px; font-weight: 650; cursor: pointer; line-height: 1.2; transition: background .15s, transform .1s; font-size: inherit; }
     .button:hover, button:hover, input[type=submit]:hover { background: var(--primary-dark); transform: translateY(-1px); }
     .button:active, button:active, input[type=submit]:active { transform: translateY(0); }
-    .button.secondary, button.secondary { background: #eef0ff; color: var(--primary-dark); }
-    .button.secondary:hover, button.secondary:hover { background: #e0e3ff; }
+    .button.secondary, button.secondary { background: #e8eef3; color: var(--primary-dark); }
+    .button.secondary:hover, button.secondary:hover { background: #d9e3eb; }
     button.danger { background: #ef4444; }
     button.danger:hover { background: #dc2626; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 16px 0; }
-    .card, section, details { background: var(--card-bg); border: 1px solid var(--line); border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); transition: box-shadow .2s, transform .2s; }
-    .card:hover { box-shadow: 0 4px 12px rgba(109, 93, 252, 0.10); transform: translateY(-2px); }
+    .card, section, details { background: var(--card-bg); border: 1px solid var(--line); border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); transition: box-shadow .2s; }
+    .card:hover { box-shadow: 0 4px 12px rgba(23, 105, 170, 0.10); }
     .card strong { display: block; font-size: 22px; margin-top: 6px; color: var(--primary-dark); }
     .card .card-label { font-size: 13px; color: var(--muted); }
     section, details { margin-top: 14px; }
@@ -719,23 +920,23 @@ def page(title: str, body: str) -> bytes:
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 10px 8px; vertical-align: top; }
     th { color: var(--muted); font-size: 13px; text-transform: none; }
-    tr:hover td { background: rgba(109,93,252,0.04); }
+    tr:hover td { background: rgba(23,105,170,0.04); }
     .muted { color: var(--muted); }
     .notice { background: var(--card-bg); border-left: 4px solid var(--primary); padding: 12px 14px; border-radius: 8px; margin-top: 14px; }
     .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
     .progress { width: 110px; height: 8px; background: var(--line); border-radius: 999px; overflow: hidden; margin-top: 5px; }
-    .bar { height: 100%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); transition: width .3s; }
+    .bar { height: 100%; background: var(--primary); transition: width .3s; }
     .viewer { background: #0f172a; border-radius: 8px; padding: 10px; }
     .viewer img, .viewer video { display: block; width: 100%; max-height: 72vh; object-fit: contain; border-radius: 6px; background: #0f172a; }
     form.inline { display: inline; }
     label { display: block; font-weight: 650; margin: 10px 0 5px; font-size: 14px; }
     input[type=text], input[type=password], input[type=url], select { width: 100%; border: 1px solid var(--input-border); border-radius: 8px; padding: 10px; font: inherit; background: var(--input-bg); color: var(--text); transition: border-color .15s, box-shadow .15s; }
-    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
+    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(23, 105, 170, 0.14); }
     input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: var(--file-bg); color: var(--text); transition: border-color .2s, background .2s; }
-    input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #f0edff; }
+    input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #eef5fa; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
     .search-box { width: 100%; border: 1px solid var(--input-border); border-radius: 8px; padding: 8px 12px; font: inherit; background: var(--input-bg); color: var(--text); margin-bottom: 10px; }
-    .search-box:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(109, 93, 252, 0.12); }
+    .search-box:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(23, 105, 170, 0.14); }
     .theme-toggle { background: none; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 16px; line-height: 1; color: var(--text); transition: background .15s; }
     .theme-toggle:hover { background: var(--line); transform: none; }
     .form-submit { margin-top: 14px; }
@@ -745,17 +946,17 @@ def page(title: str, body: str) -> bytes:
     .disk-bar-inner { height: 100%; border-radius: 999px; transition: width .3s; background: linear-gradient(90deg, #22c55e, #84cc16); }
     .disk-bar-inner.warn { background: linear-gradient(90deg, #f59e0b, #ef4444); }
     .disk-bar-inner.danger { background: #ef4444; }
-    .drop-zone { border: 2px dashed var(--line); border-radius: 10px; padding: 32px 16px; text-align: center; color: var(--muted); font-size: 14px; cursor: pointer; transition: border-color .2s, background .2s, transform .15s; position: relative; }
-    .drop-zone:hover, .drop-zone.drag-over { border-color: var(--primary); background: rgba(109,93,252,0.06); transform: scale(1.01); }
+    .drop-zone { border: 2px dashed var(--line); border-radius: 8px; padding: 32px 16px; text-align: center; color: var(--muted); font-size: 14px; cursor: pointer; transition: border-color .2s, background .2s; position: relative; }
+    .drop-zone:hover, .drop-zone.drag-over { border-color: var(--primary); background: rgba(23,105,170,0.06); }
     .drop-zone.drag-over { border-style: solid; }
     .drop-zone input[type=file] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
     .filter-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
-    .filter-btn { background: #eef0ff; color: var(--primary-dark); border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s; }
+    .filter-btn { background: #e8eef3; color: var(--primary-dark); border: 0; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s; }
     .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
-    .tag { display: inline-block; background: #eef0ff; color: var(--primary-dark); padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+    .tag { display: inline-block; background: #edf2f5; color: var(--primary-dark); padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
     .modal-overlay.active { display: flex; }
-    .modal-content { background: var(--card-bg); border-radius: 12px; padding: 24px; max-width: 340px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.2); color: var(--text); }
+    .modal-content { background: var(--card-bg); border-radius: 8px; padding: 24px; max-width: 340px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.2); color: var(--text); }
     .share-actions { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
     .modal-content h3 { margin: 0 0 4px; font-size: 16px; }
     .modal-content p { font-size: 13px; margin: 4px 0 12px; }
@@ -763,37 +964,156 @@ def page(title: str, body: str) -> bytes:
     .upload-progress { display: none; margin-top: 12px; }
     .upload-progress.active { display: block; }
     .upload-bar-outer { width: 100%; height: 10px; background: #eef0f6; border-radius: 999px; overflow: hidden; }
-    .upload-bar-inner { height: 100%; width: 0%; background: linear-gradient(90deg, #6d5dfc, #8b5cf6); border-radius: 999px; transition: width .2s; }
+    .upload-bar-inner { height: 100%; width: 0%; background: var(--primary); border-radius: 999px; transition: width .2s; }
     .upload-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
     .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-    html.dark { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #0f172a; --input-border: #475569; --file-bg: #1e293b; }
-    html.dark .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
+    html.dark { color-scheme: dark; --bg: #14181d; --text: #e7ebef; --muted: #9aa6b2; --line: #333b44; --primary: #4da3df; --primary-dark: #2987c7; --card-bg: #1d232a; --input-bg: #161b21; --input-border: #46515d; --file-bg: #252c34; }
+    html.dark .card:hover { box-shadow: 0 4px 12px rgba(77, 163, 223, 0.15); }
     html.dark .notice { background: #1e293b; border-color: var(--primary); }
     html.dark .button.secondary, html.dark button.secondary { background: #1e293b; color: var(--primary); }
     html.dark .button.secondary:hover, html.dark button.secondary:hover { background: #334155; }
     html.dark input[type=file]:hover, html.dark input[type=file]:focus { background: #334155; border-color: var(--primary); }
-    html.dark tr:hover td { background: rgba(129,140,248,0.06); }
+    html.dark tr:hover td { background: rgba(77,163,223,0.06); }
     html.dark .upload-bar-outer, html.dark .disk-bar-outer { background: #334155; }
     html.dark .filter-btn { background: #1e293b; color: var(--primary); }
     html.dark .tag { background: #1e293b; color: var(--primary); }
     html.dark .toast { background: #e2e8f0; color: #0f172a; }
     html.dark .code-block { background: #1a1a2e; }
-    @media (prefers-color-scheme: dark) { html:not(.light) { color-scheme: dark; --bg: #0f172a; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #818cf8; --primary-dark: #a5b4fc; --card-bg: #1e293b; --input-bg: #0f172a; --input-border: #475569; --file-bg: #1e293b; } }
+    @media (prefers-color-scheme: dark) { html:not(.light) { color-scheme: dark; --bg: #14181d; --text: #e7ebef; --muted: #9aa6b2; --line: #333b44; --primary: #4da3df; --primary-dark: #2987c7; --card-bg: #1d232a; --input-bg: #161b21; --input-border: #46515d; --file-bg: #252c34; } }
     @media (prefers-color-scheme: dark) {
-      html:not(.light) .card:hover { box-shadow: 0 4px 12px rgba(129, 140, 248, 0.15); }
+      html:not(.light) .card:hover { box-shadow: 0 4px 12px rgba(77, 163, 223, 0.15); }
       html:not(.light) .notice { background: #1e293b; border-color: var(--primary); }
       html:not(.light) .button.secondary, html:not(.light) button.secondary { background: #1e293b; color: var(--primary); }
       html:not(.light) .button.secondary:hover, html:not(.light) button.secondary:hover { background: #334155; }
       html:not(.light) input[type=file]:hover, html:not(.light) input[type=file]:focus { background: #334155; border-color: var(--primary); }
-      html:not(.light) tr:hover td { background: rgba(129,140,248,0.06); }
+      html:not(.light) tr:hover td { background: rgba(77,163,223,0.06); }
       html:not(.light) .upload-bar-outer, html:not(.light) .disk-bar-outer { background: #334155; }
       html:not(.light) .filter-btn { background: #1e293b; color: var(--primary); }
       html:not(.light) .tag { background: #1e293b; color: var(--primary); }
       html:not(.light) .toast { background: #e2e8f0; color: #0f172a; }
       html:not(.light) .code-block { background: #1a1a2e; }
     }
-    @media (max-width: 720px) { header, .form-grid { display: block; } .actions { margin-top: 12px; } th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) { display: none; } }
+    :root { --primary: #1769aa; --primary-dark: #0f548c; --bg: #f3f5f7; --text: #18212b; --muted: #64707d; --line: #dce1e6; --card-bg: #fff; --input-bg: #fff; --input-border: #cbd3db; --file-bg: #f8fafb; }
+    main { width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 20px 0 40px; }
+    h1 { font-size: 26px; }
+    h2 { font-size: 16px; }
+    .button, button, input[type=submit] { border-radius: 6px; background: var(--primary); padding: 9px 12px; transition: background .15s; }
+    .button:hover, button:hover, input[type=submit]:hover { background: var(--primary-dark); transform: none; }
+    .button.secondary, button.secondary { background: #e8eef3; color: #23435d; }
+    .button.secondary:hover, button.secondary:hover { background: #d9e3eb; }
+    .site-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+    .header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+    .icon-button { width: 40px; height: 40px; padding: 0; display: inline-grid; place-items: center; font-size: 20px; }
+    .theme-toggle { border: 1px solid var(--line); color: var(--text); }
+    .app-shell { display: grid; grid-template-columns: 64px minmax(0, 1fr); grid-template-areas: "tools files"; gap: 12px; align-items: start; }
+    .file-workspace { grid-area: files; min-width: 0; padding: 0; }
+    .admin-tool-rail { grid-area: tools; position: sticky; top: 16px; z-index: 30; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); box-shadow: 0 6px 18px rgba(15, 23, 42, .08); }
+    .admin-tool-button { position: relative; width: 46px; height: 46px; padding: 0; display: grid; place-items: center; border-radius: 6px; background: transparent; color: var(--text); }
+    .admin-tool-button:hover, .admin-tool-button[aria-expanded="true"] { background: var(--primary); color: #fff; }
+    .admin-tool-icon { font-size: 25px; line-height: 1; }
+    .admin-tool-tooltip { position: absolute; left: calc(100% + 12px); top: 50%; transform: translateY(-50%); width: max-content; max-width: 180px; padding: 6px 9px; border-radius: 4px; background: #1f2933; color: #fff; font-size: 12px; font-weight: 600; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .15s; }
+    .admin-tool-button:hover .admin-tool-tooltip, .admin-tool-button:focus-visible .admin-tool-tooltip { opacity: 1; visibility: visible; }
+    body.admin-modal-open { overflow: hidden; }
+    .admin-modal-overlay { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 23, 42, .58); }
+    .admin-modal-overlay[hidden] { display: none; }
+    .admin-modal { display: flex; flex-direction: column; width: min(100%, 520px); max-height: 88vh; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); color: var(--text); box-shadow: 0 20px 60px rgba(15, 23, 42, .28); }
+    .admin-modal-upload { width: min(100%, 560px); }
+    .admin-modal-tasks { width: min(100%, 860px); }
+    .admin-modal-header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+    .admin-modal-header h2, .admin-modal-header p { margin: 0; }
+    .admin-modal-header p { margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .admin-modal-body { min-height: 0; overflow-y: auto; padding: 18px; }
+    .admin-modal-close { flex: 0 0 40px; width: 40px; height: 40px; padding: 0; display: grid; place-items: center; background: transparent; color: var(--text); font-size: 24px; line-height: 1; }
+    .admin-modal-close:hover { background: var(--line); color: var(--text); }
+    .admin-modal input[type=submit] { width: 100%; }
+    .task-section { overflow-x: auto; }
+    .task-section table { min-width: 680px; font-size: 12px; }
+    .task-section input[type=password] { min-width: 110px; }
+    .status-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); overflow: hidden; }
+    .status-item { min-width: 0; padding: 12px; border-right: 1px solid var(--line); }
+    .status-item:last-child { border-right: 0; }
+    .status-item > span { display: block; color: var(--muted); font-size: 12px; }
+    .status-item strong { display: block; margin-top: 4px; font-size: 17px; overflow-wrap: anywhere; }
+    .disk-bar-outer { height: 6px; }
+    .disk-bar-inner { background: #2f855a; }
+    .disk-bar-inner.warn { background: #d69e2e; }
+    .disk-bar-inner.danger { background: #d64545; }
+    .file-section { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); padding: 16px; box-shadow: none; }
+    .section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .section-heading h2 { margin: 0; }
+    .site-note { margin-top: 12px; padding: 0 2px; font-size: 12px; }
+    .search-box { margin-bottom: 10px; border-radius: 6px; }
+    .filter-bar { gap: 5px; margin-bottom: 8px; }
+    .filter-btn { background: #e8eef3; color: #29465e; border-radius: 6px; padding: 6px 10px; }
+    .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
+    .file-table { table-layout: auto; }
+    .file-table th:last-child { width: 190px; text-align: right; }
+    .file-row-main { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+    .file-type-icon { width: 32px; flex: 0 0 32px; font-size: 28px; line-height: 1; text-align: center; color: #3b596f; }
+    .file-details { min-width: 0; }
+    .file-name { overflow-wrap: anywhere; font-weight: 650; }
+    .file-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .tag { background: #edf2f5; color: #415566; }
+    .file-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; min-width: 184px; }
+    .file-action { white-space: nowrap; }
+    .file-menu { position: relative; }
+    .file-menu-toggle { width: 40px; height: 40px; padding: 0; font-size: 20px; }
+    .file-menu-panel { position: absolute; z-index: 20; right: 0; top: calc(100% + 6px); width: min(260px, calc(100vw - 32px)); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); box-shadow: 0 10px 28px rgba(15, 23, 42, .16); }
+    .file-menu-panel[hidden] { display: none; }
+    .menu-command { display: block; width: 100%; padding: 9px 10px; border-radius: 4px; text-align: left; background: transparent; color: var(--text); font-weight: 600; }
+    .menu-command:hover { background: var(--file-bg); color: var(--text); }
+    .danger-text { color: #b4232c; }
+    .renew-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; padding-top: 6px; }
+    .renew-form input[type=password] { min-width: 0; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .filter-empty { display: none; padding: 24px 16px; color: var(--muted); text-align: center; }
+    .filter-empty.visible { display: block; }
+    .drop-zone { border-radius: 8px; padding: 22px 12px; transform: none; }
+    .drop-zone:hover, .drop-zone.drag-over { background: #eef5fa; transform: none; }
+    .drop-icon { display: block; font-size: 28px; color: var(--primary); }
+    #drop-file-name { margin-top: 6px; font-size: 12px; overflow-wrap: anywhere; }
+    .bar, .upload-bar-inner { background: var(--primary); }
+    .modal-content { border-radius: 8px; }
+    html.dark { --bg: #14181d; --text: #e7ebef; --muted: #9aa6b2; --line: #333b44; --primary: #4da3df; --primary-dark: #2987c7; --card-bg: #1d232a; --input-bg: #161b21; --input-border: #46515d; --file-bg: #252c34; }
+    html.dark .button.secondary, html.dark button.secondary { background: #2b343d; color: #d9e4ec; }
+    html.dark .button.secondary:hover, html.dark button.secondary:hover { background: #35414c; }
+    html.dark .filter-btn, html.dark .tag { background: #2b343d; color: #d9e4ec; }
+    html.dark .menu-command:hover { background: #2b343d; }
+    @media (prefers-color-scheme: dark) {
+      html:not(.light) { --bg: #14181d; --text: #e7ebef; --muted: #9aa6b2; --line: #333b44; --primary: #4da3df; --primary-dark: #2987c7; --card-bg: #1d232a; --input-bg: #161b21; --input-border: #46515d; --file-bg: #252c34; }
+      html:not(.light) .button.secondary, html:not(.light) button.secondary { background: #2b343d; color: #d9e4ec; }
+      html:not(.light) .button.secondary:hover, html:not(.light) button.secondary:hover { background: #35414c; }
+      html:not(.light) .filter-btn, html:not(.light) .tag { background: #2b343d; color: #d9e4ec; }
+      html:not(.light) .menu-command:hover { background: #2b343d; }
+    }
+    @media (max-width: 900px) {
+      main { width: min(calc(100% - 24px), 720px); padding: 12px 0 104px; }
+      .site-header { align-items: flex-start; }
+      .app-shell { display: block; }
+      .file-workspace { width: 100%; }
+      .admin-tool-rail { position: fixed; top: auto; right: 50%; bottom: 12px; z-index: 900; flex-direction: row; width: max-content; transform: translateX(50%); padding: 7px; box-shadow: 0 10px 30px rgba(15, 23, 42, .22); }
+      .admin-tool-tooltip { display: none; }
+      .admin-modal-overlay { padding: 16px 3vw; }
+      .admin-modal, .admin-modal-upload, .admin-modal-tasks { width: 94vw; max-height: 88vh; }
+      .status-strip { grid-template-columns: 1fr 1fr; }
+      .status-item:nth-child(2) { border-right: 0; }
+      .status-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .file-table thead { display: none; }
+      .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+      .file-row:last-child { border-bottom: 0; }
+      .file-row > td { display: block; border: 0; padding: 0; }
+      .file-actions { min-width: 0; }
+    }
+    @media (max-width: 520px) {
+      .site-header { flex-wrap: wrap; }
+      .header-actions { width: 100%; justify-content: flex-start; }
+      .status-strip { grid-template-columns: 1fr; }
+      .status-item { border-right: 0; border-bottom: 1px solid var(--line); }
+      .status-item:last-child { border-bottom: 0; }
+      .file-row { grid-template-columns: 1fr; }
+      .file-actions { justify-content: flex-start; padding-left: 42px; }
+    }
     """
     script = """
     function showToast(msg) {
@@ -808,122 +1128,166 @@ def page(title: str, body: str) -> bytes:
       var url = new URL(path, window.location.href).href;
       navigator.clipboard.writeText(url).then(function(){ showToast('\u94fe\u63a5\u5df2\u590d\u5236'); });
     }
+    function apiError(xhr) {
+      try {
+        var payload = JSON.parse(xhr.responseText || '{}');
+        return payload.error || '\u8bf7\u6c42\u5931\u8d25';
+      } catch (e) {
+        return '\u8bf7\u6c42\u5931\u8d25';
+      }
+    }
+    function delay(ms) {
+      return new Promise(function(resolve) { setTimeout(resolve, ms); });
+    }
+    async function postFormJson(path, fields) {
+      var response = await fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams(fields).toString()
+      });
+      var payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || '\u8bf7\u6c42\u5931\u8d25');
+      return payload;
+    }
+    async function initUpload(form, file) {
+      return postFormJson('/api/upload_init', {
+        password: form.querySelector('[name=password]').value,
+        filename: file.name,
+        custom_filename: (form.querySelector('[name=filename]') || {}).value || '',
+        size: String(file.size),
+        retention: (form.querySelector('[name=retention]') || {}).value || '0'
+      });
+    }
+    async function finishUpload(session) {
+      return postFormJson('/api/upload_finish', {
+        upload_id: session.upload_id,
+        upload_token: session.upload_token
+      });
+    }
+    async function cancelUpload(session) {
+      return postFormJson('/api/upload_cancel', {
+        upload_id: session.upload_id,
+        upload_token: session.upload_token
+      });
+    }
+    async function sendChunk(session, file, index, state) {
+      var retryDelays = [1000, 3000];
+      var start = index * session.chunk_size;
+      var end = Math.min(start + session.chunk_size, file.size);
+      var chunk = file.slice(start, end);
+      for (var attempt = 0; attempt < 3; attempt++) {
+        if (state.cancelled) throw new Error('\u4e0a\u4f20\u5df2\u53d6\u6d88');
+        try {
+          await new Promise(function(resolve, reject) {
+            var xhr = new XMLHttpRequest();
+            state.activeXhrs.add(xhr);
+            function settle(callback, value) {
+              state.activeXhrs.delete(xhr);
+              callback(value);
+            }
+            xhr.upload.onprogress = function(event) {
+              if (event.lengthComputable) {
+                state.loaded[index] = event.loaded;
+                state.render();
+              }
+            };
+            xhr.onload = function() {
+              if (xhr.status >= 200 && xhr.status < 300) settle(resolve);
+              else settle(reject, new Error(apiError(xhr)));
+            };
+            xhr.onerror = function() { settle(reject, new Error('\u7f51\u7edc\u8bf7\u6c42\u5931\u8d25')); };
+            xhr.onabort = function() { settle(reject, new Error('\u4e0a\u4f20\u5df2\u53d6\u6d88')); };
+            xhr.open('POST', '/api/upload_chunk');
+            xhr.setRequestHeader('X-Upload-Id', session.upload_id);
+            xhr.setRequestHeader('X-Upload-Token', session.upload_token);
+            xhr.setRequestHeader('X-Chunk-Index', String(index));
+            xhr.send(chunk);
+          });
+          state.loaded[index] = chunk.size;
+          state.completed += 1;
+          state.render();
+          return;
+        } catch (error) {
+          state.loaded[index] = 0;
+          state.render();
+          if (state.cancelled || attempt === 2) throw error;
+          state.retries += 1;
+          state.render();
+          await delay(retryDelays[attempt]);
+        }
+      }
+    }
     async function handleUpload(form) {
       var bar = document.getElementById('upload-bar');
       var status = document.getElementById('upload-status');
       var outer = document.getElementById('upload-progress');
-      var btn = form.querySelector('input[type=submit]');
-      var fileInput = form.querySelector('[name=file]');
-      var file = fileInput.files[0];
+      var submit = form.querySelector('input[type=submit]');
+      var cancel = document.getElementById('upload-cancel');
+      var uploadModal = document.getElementById('upload-modal');
+      var file = form.querySelector('[name=file]').files[0];
       if (!file) return false;
-      var password = form.querySelector('[name=password]').value;
-      var customName = (form.querySelector('[name=filename]') || {}).value || '';
-      var retention = (form.querySelector('[name=retention]') || {}).value || '0';
+      var session = null;
+      var state = {
+        activeXhrs: new Set(), loaded: [], completed: 0, active: 0,
+        retries: 0, cancelled: false, render: function() {}
+      };
       outer.classList.add('active');
-      btn.disabled = true;
-      btn.value = '\u4e0a\u4f20\u4e2d...';
-      
-      var chunkSize = 5 * 1024 * 1024;
-      var totalChunks = Math.ceil(file.size / chunkSize);
-      var uploadId = Math.random().toString(36).substring(2) + Date.now().toString(36);
-      
-      var uploadedBytesPerChunk = new Array(totalChunks).fill(0);
-      var currentChunk = 0;
-      var activeUploads = 0;
-      var maxConcurrent = 3;
-      var hasFailed = false;
-
-      function updateProgress() {
-        var totalLoaded = 0;
-        for (var k = 0; k < totalChunks; k++) totalLoaded += uploadedBytesPerChunk[k];
-        var pct = Math.round(totalLoaded / file.size * 100);
-        bar.style.width = pct + '%';
-        var loadedMB = (totalLoaded / 1048576).toFixed(1);
-        var totalMB = (file.size / 1048576).toFixed(1);
-        status.textContent = pct + '% \u00b7 ' + loadedMB + ' / ' + totalMB + ' MB';
-      }
-
-      function uploadNext() {
-        return new Promise(function(resolve, reject) {
-          function next() {
-            if (hasFailed) return reject(new Error('Upload failed'));
-            if (currentChunk >= totalChunks) {
-              if (activeUploads === 0) resolve();
-              return;
-            }
-            var i = currentChunk++;
-            activeUploads++;
-            var start = i * chunkSize;
-            var end = Math.min(start + chunkSize, file.size);
-            var chunk = file.slice(start, end);
-            
-            var xhr = new XMLHttpRequest();
-            xhr.upload.onprogress = function(e) {
-              if (e.lengthComputable) {
-                uploadedBytesPerChunk[i] = e.loaded;
-                updateProgress();
-              }
-            };
-            xhr.onload = function() {
-              if (xhr.status === 200) {
-                uploadedBytesPerChunk[i] = chunk.size;
-                updateProgress();
-                activeUploads--;
-                next();
-              } else {
-                hasFailed = true;
-                reject(xhr);
-              }
-            };
-            xhr.onerror = function() { hasFailed = true; reject(xhr); };
-            xhr.open('POST', '/api/upload_chunk');
-            xhr.setRequestHeader('X-Upload-Id', uploadId);
-            xhr.setRequestHeader('X-Chunk-Index', i);
-            xhr.setRequestHeader('X-Password', encodeURIComponent(password));
-            xhr.send(chunk);
-          }
-          
-          while (activeUploads < maxConcurrent && currentChunk < totalChunks) {
-            next();
-          }
-        });
-      }
-
+      if (uploadModal) uploadModal.dataset.busy = 'true';
+      submit.disabled = true;
+      submit.value = '\u4e0a\u4f20\u4e2d...';
       try {
-        await uploadNext();
-        
-        status.textContent = '\u5408\u5e76\u6587\u4ef6\u4e2d...';
-        await new Promise(function(resolve, reject) {
-          var xhr = new XMLHttpRequest();
-          xhr.onload = function() {
-            if (xhr.status === 200) resolve();
-            else reject(xhr);
-          };
-          xhr.onerror = function() { reject(xhr); };
-          xhr.open('POST', '/api/upload_finish');
-          xhr.setRequestHeader('X-Upload-Id', uploadId);
-          xhr.setRequestHeader('X-Total-Chunks', totalChunks);
-          xhr.setRequestHeader('X-Password', encodeURIComponent(password));
-          xhr.setRequestHeader('X-Filename', encodeURIComponent(customName));
-          xhr.setRequestHeader('X-Retention', retention);
-          xhr.setRequestHeader('X-Orig-Filename', encodeURIComponent(file.name));
-          xhr.send();
-        });
-        
+        session = await initUpload(form, file);
+        cancel.hidden = false;
+        state.loaded = new Array(session.total_chunks).fill(0);
+        state.render = function() {
+          var loaded = state.loaded.reduce(function(total, value) { return total + value; }, 0);
+          var percent = Math.round(loaded / file.size * 100);
+          bar.style.width = percent + '%';
+          status.textContent = percent + '% \u00b7 ' + (loaded / 1048576).toFixed(1) + ' / ' +
+            (file.size / 1048576).toFixed(1) + ' MiB \u00b7 \u5206\u7247 ' + state.completed + '/' +
+            session.total_chunks + ' \u00b7 \u6d3b\u8dc3 ' + state.active + ' \u00b7 \u91cd\u8bd5 ' + state.retries;
+        };
+        cancel.onclick = async function() {
+          if (state.cancelled) return;
+          state.cancelled = true;
+          state.activeXhrs.forEach(function(xhr) { xhr.abort(); });
+          try { await cancelUpload(session); } catch (error) {}
+          status.textContent = '\u4e0a\u4f20\u5df2\u53d6\u6d88';
+        };
+        var nextIndex = 0;
+        async function worker() {
+          while (!state.cancelled) {
+            var index = nextIndex++;
+            if (index >= session.total_chunks) return;
+            state.active += 1;
+            state.render();
+            try {
+              await sendChunk(session, file, index, state);
+            } finally {
+              state.active -= 1;
+              state.render();
+            }
+          }
+          throw new Error('\u4e0a\u4f20\u5df2\u53d6\u6d88');
+        }
+        var workers = [];
+        var workerCount = Math.min(session.concurrency, session.total_chunks);
+        for (var i = 0; i < workerCount; i++) workers.push(worker());
+        await Promise.all(workers);
+        if (state.cancelled) throw new Error('\u4e0a\u4f20\u5df2\u53d6\u6d88');
+        status.textContent = '\u6821\u9a8c\u6587\u4ef6\u4e2d...';
+        await finishUpload(session);
         bar.style.width = '100%';
         status.textContent = '\u4e0a\u4f20\u5b8c\u6210\uff01\u6b63\u5728\u8df3\u8f6c...';
-        setTimeout(function(){ window.location.href = '/downloads/'; }, 800);
-      } catch (err) {
-        var msg = '\u4e0a\u4f20\u5931\u8d25';
-        if (err && err.responseText) {
-          try {
-            var m = err.responseText.match(/<p>([^<]+)<\\/p>/);
-            if (m) msg = m[1];
-          } catch(e) {}
-        }
-        status.textContent = msg;
-        btn.disabled = false;
-        btn.value = '\u91cd\u8bd5\u4e0a\u4f20';
+        setTimeout(function() { window.location.href = '/downloads/'; }, 800);
+      } catch (error) {
+        if (!state.cancelled) status.textContent = error.message || '\u4e0a\u4f20\u5931\u8d25';
+      } finally {
+        state.activeXhrs.forEach(function(xhr) { xhr.abort(); });
+        if (uploadModal) uploadModal.dataset.busy = 'false';
+        cancel.hidden = true;
+        submit.disabled = false;
+        submit.value = '\u91cd\u8bd5\u4e0a\u4f20';
       }
       return false;
     }
@@ -956,24 +1320,86 @@ def page(title: str, body: str) -> bytes:
     var _curFilter = 'all';
     var _curSearch = '';
     function _applyFilters() {
-      var rows = document.querySelectorAll('tr[data-type]');
+      var rows = document.querySelectorAll('.file-row');
       var q = _curSearch.toLowerCase();
+      var visible = 0;
       for (var i = 0; i < rows.length; i++) {
+        var name = rows[i].getAttribute('data-name') || '';
         var matchType = _curFilter === 'all' || rows[i].getAttribute('data-type') === _curFilter;
-        var matchSearch = !q || rows[i].querySelector('td').textContent.toLowerCase().indexOf(q) >= 0;
+        var matchSearch = !q || name.toLowerCase().indexOf(q) >= 0;
         rows[i].style.display = matchType && matchSearch ? '' : 'none';
+        if (matchType && matchSearch) visible += 1;
       }
+      var empty = document.getElementById('filter-empty');
+      if (empty) empty.classList.toggle('visible', rows.length > 0 && visible === 0);
     }
-    function filterFiles(type) {
+    function filterFiles(type, selectedButton) {
       _curFilter = type;
       var btns = document.querySelectorAll('.filter-btn');
       for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
-      if (event && event.target) event.target.classList.add('active');
+      if (selectedButton) selectedButton.classList.add('active');
       _applyFilters();
     }
     function searchFiles(q) {
       _curSearch = q;
       _applyFilters();
+    }
+    function closeFileMenus(exceptMenu) {
+      var menus = document.querySelectorAll('.file-menu');
+      for (var i = 0; i < menus.length; i++) {
+        if (menus[i] === exceptMenu) continue;
+        var button = menus[i].querySelector('.file-menu-toggle');
+        var panel = menus[i].querySelector('.file-menu-panel');
+        if (button) button.setAttribute('aria-expanded', 'false');
+        if (panel) panel.hidden = true;
+      }
+    }
+    function toggleFileMenu(button) {
+      var menu = button.closest('.file-menu');
+      var panel = document.getElementById(button.getAttribute('aria-controls'));
+      if (!menu || !panel) return;
+      var opening = button.getAttribute('aria-expanded') !== 'true';
+      closeFileMenus(opening ? menu : null);
+      button.setAttribute('aria-expanded', opening ? 'true' : 'false');
+      panel.hidden = !opening;
+      if (opening) {
+        var first = panel.querySelector('button, a, input');
+        if (first) first.focus();
+      }
+    }
+    var activeAdminModal = null;
+    var previousAdminTrigger = null;
+    function openAdminModal(button) {
+      var modal = document.getElementById(button.getAttribute('data-admin-modal'));
+      if (!modal) return;
+      if (activeAdminModal && activeAdminModal !== modal && !closeActiveAdminModal()) return;
+      activeAdminModal = modal;
+      previousAdminTrigger = button;
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+      button.setAttribute('aria-expanded', 'true');
+      document.body.classList.add('admin-modal-open');
+      var first = modal.querySelector('input:not([type=hidden]), select, button, a');
+      if (first) first.focus();
+    }
+    function closeAdminModal(modal) {
+      if (!modal) return true;
+      if (modal.dataset.busy === 'true') {
+        showToast('请先完成或取消上传');
+        return false;
+      }
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+      var trigger = document.querySelector('[aria-controls="' + modal.id + '"]');
+      if (trigger) trigger.setAttribute('aria-expanded', 'false');
+      document.body.classList.remove('admin-modal-open');
+      activeAdminModal = null;
+      if (previousAdminTrigger) previousAdminTrigger.focus();
+      previousAdminTrigger = null;
+      return true;
+    }
+    function closeActiveAdminModal() {
+      return closeAdminModal(activeAdminModal);
     }
     function toggleTheme() {
       var h = document.documentElement;
@@ -1022,8 +1448,41 @@ def page(title: str, body: str) -> bytes:
       if (m) m.classList.remove('active');
     }
     document.addEventListener('click', function(e) {
-      var btn = e.target.closest && e.target.closest('.share-btn');
-      if (btn) showShare(btn.dataset.url, btn.dataset.name);
+      var adminTrigger = e.target.closest && e.target.closest('[data-admin-modal]');
+      if (adminTrigger) {
+        openAdminModal(adminTrigger);
+        return;
+      }
+      var adminClose = e.target.closest && e.target.closest('[data-close-admin-modal]');
+      if (adminClose) {
+        closeActiveAdminModal();
+        return;
+      }
+      var adminOverlay = e.target.closest && e.target.closest('.admin-modal-overlay');
+      if (adminOverlay && e.target === adminOverlay) {
+        closeAdminModal(adminOverlay);
+        return;
+      }
+      var menuButton = e.target.closest && e.target.closest('.file-menu-toggle');
+      if (menuButton) {
+        toggleFileMenu(menuButton);
+        return;
+      }
+      var shareButton = e.target.closest && e.target.closest('.share-btn');
+      if (shareButton) {
+        showShare(shareButton.dataset.url, shareButton.dataset.name);
+        closeFileMenus();
+        return;
+      }
+      if (!(e.target.closest && e.target.closest('.file-menu'))) closeFileMenus();
+    });
+    document.addEventListener('keydown', function(e) {
+      if (e.key !== 'Escape') return;
+      var openButton = document.querySelector('.file-menu-toggle[aria-expanded="true"]');
+      closeFileMenus();
+      closeShare();
+      closeActiveAdminModal();
+      if (openButton) openButton.focus();
     });
     """
     html_doc = f"""<!doctype html>
@@ -1057,64 +1516,94 @@ def retention_select_html(field_id: str) -> str:
     )
 
 
+FILE_TYPE_ICONS = {
+    "image": "▧",
+    "video": "▶",
+    "text": "≡",
+    "document": "▤",
+    "archive": "▣",
+    "other": "•",
+}
+
+
+def file_type_icon(file_type_name: str) -> str:
+    return FILE_TYPE_ICONS.get(file_type_name, FILE_TYPE_ICONS["other"])
+
+
 def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> str:
     if not files:
         return '<div class="empty">暂无可下载文件</div>'
     filter_bar = (
         '<input class="search-box" type="text" placeholder="\u641c\u7d22\u6587\u4ef6\u540d..." oninput="searchFiles(this.value)">'
         '<div class="filter-bar">'
-        '<button class="filter-btn active" type="button" onclick="filterFiles(\'all\')">\u5168\u90e8</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'image\')">\u56fe\u7247</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'video\')">\u89c6\u9891</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'text\')">\u6587\u672c</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'document\')">\u6587\u6863</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\')">\u538b\u7f29\u5305</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'other\')">\u5176\u4ed6</button>'
+        '<button class="filter-btn active" type="button" onclick="filterFiles(\'all\', this)">\u5168\u90e8</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'image\', this)">\u56fe\u7247</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'video\', this)">\u89c6\u9891</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'text\', this)">\u6587\u672c</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'document\', this)">\u6587\u6863</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\', this)">\u538b\u7f29\u5305</button>'
+        '<button class="filter-btn" type="button" onclick="filterFiles(\'other\', this)">\u5176\u4ed6</button>'
         '</div>'
     )
     rows = []
-    for item in files:
+    for index, item in enumerate(files):
         name = str(item["name"])
         url_name = str(item["url_name"])
         ft = str(item.get("file_type", "other"))
         kind = file_kind(name)
-        preview = f'<a class="button secondary" href="/view/{url_name}">预览</a> ' if kind else ""
-        share_btn = (
-            f'<button class="share-btn secondary" type="button" '
-            f'data-url="/file/{url_name}" '
-            f'data-name="{html.escape(name, quote=True)}">分享</button>'
+        safe_name = html.escape(name)
+        safe_name_attr = html.escape(name, quote=True)
+        menu_id = f"file-menu-{index}"
+        preview = (
+            f'<a class="button secondary file-action" href="/view/{url_name}">预览</a>'
+            if kind else ""
         )
         ret_label = html.escape(str(item.get("retention_label", "")))
-        if compact:
-            actions = f'{preview}<a class="button secondary" href="/file/{url_name}">下载</a> {share_btn}'
-        else:
-            renew_btn = (
-                f'<form class="inline" method="post" action="/api/renew">'
-                f'<input type="hidden" name="filename" value="{html.escape(name, quote=True)}">'
-                f'<input type="password" name="password" placeholder="\u5bc6\u7801" style="width:70px;padding:5px 6px;font-size:12px;" required>'
-                f'<button class="secondary" type="submit" style="font-size:12px;padding:5px 8px;">\u7eed\u547d</button></form>'
-            )
-            actions = (
-                preview +
-                f'<a class="button secondary" href="/file/{url_name}">普通下载</a> '
-                f'<a class="button" href="/once/{url_name}">一次性下载</a> '
-                + share_btn + ' ' + renew_btn
-            )
+        renew_form = (
+            '<form class="renew-form" method="post" action="/api/renew">'
+            f'<input type="hidden" name="filename" value="{safe_name_attr}">'
+            f'<label class="sr-only" for="renew-password-{index}">管理密码</label>'
+            f'<input id="renew-password-{index}" type="password" name="password" '
+            'placeholder="管理密码" required>'
+            '<button class="secondary" type="submit">续期</button></form>'
+        )
+        more_menu = (
+            '<div class="file-menu">'
+            f'<button class="file-menu-toggle secondary" type="button" '
+            f'aria-label="更多操作：{safe_name_attr}" aria-expanded="false" '
+            f'aria-controls="{menu_id}">⋯</button>'
+            f'<div id="{menu_id}" class="file-menu-panel" hidden>'
+            f'<button class="share-btn menu-command" type="button" '
+            f'data-url="/file/{url_name}" data-name="{safe_name_attr}">二维码分享</button>'
+            f'<a class="menu-command danger-text" href="/once/{url_name}">一次性下载</a>'
+            f'{renew_form}</div></div>'
+        )
+        actions = (
+            preview
+            + f'<a class="button secondary file-action" href="/file/{url_name}">下载</a>'
+            + more_menu
+        )
         rows.append(
-            f'<tr data-type="{ft}">'
-            f'<td class="code">{html.escape(name)}</td>'
-            f"<td>{html.escape(str(item['size_human']))}</td>"
-            f"<td>{html.escape(str(item['created_at_text']))}</td>"
-            f"<td>{html.escape(str(item['expires_at_text']))}</td>"
-            f"<td>{html.escape(str(item['remaining_text']))}</td>"
-            f'<td><span class="tag">{ret_label}</span></td>'
-            f'<td class="row-actions">{actions}</td>'
+            f'<tr class="file-row" data-type="{html.escape(ft, quote=True)}" '
+            f'data-name="{safe_name_attr}">'
+            '<td><div class="file-row-main">'
+            f'<span class="file-type-icon" aria-hidden="true">{file_type_icon(ft)}</span>'
+            '<div class="file-details">'
+            f'<div class="file-name code">{safe_name}</div>'
+            '<div class="file-meta">'
+            f'<span>{html.escape(str(item["size_human"]))}</span>'
+            f'<span>入库 {html.escape(str(item["created_at_text"]))}</span>'
+            f'<span>剩余 {html.escape(str(item["remaining_text"]))}</span>'
+            f'<span class="tag">{ret_label}</span>'
+            '</div></div></div></td>'
+            f'<td class="file-actions">{actions}</td>'
             "</tr>"
         )
     return (
         filter_bar +
-        "<table><thead><tr><th>文件名</th><th>大小</th><th>入库时间</th><th>过期时间</th><th>剩余时间</th><th>保留</th><th>操作</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table>"
+        '<table class="file-table"><thead><tr><th>文件</th><th>操作</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+        '<div id="filter-empty" class="filter-empty">没有匹配的文件</div>'
     )
 
 
@@ -1163,92 +1652,119 @@ def render_home(message: str = "") -> bytes:
     files = scan_files()
     stats = get_disk_stats()
     tasks = get_aria2_tasks()
+    task_items = tasks.get("tasks") if isinstance(tasks, dict) else []
+    task_count = len(task_items) if isinstance(task_items, list) else 0
+    tasks_ok = bool(tasks.get("ok")) if isinstance(tasks, dict) else False
+    task_summary = f"{task_count} 个任务" if tasks_ok else "状态不可用"
     message_html = f'<div class="notice">{html.escape(message)}</div>' if message else ""
     body = f"""
-<header>
+<header class="site-header">
   <div>
     <h1>临时下载站</h1>
-    <p>管理员添加 HTTP/HTTPS 链接后，小鸡下载到本地，朋友再从这里取文件。</p>
+    <p>给朋友分享临时文件</p>
   </div>
-  <div class="actions">
-    <a class="button" href="/downloads/">下载目录</a>
-    <button class="secondary" type="button" onclick="location.reload()">刷新</button>
-    <button class="theme-toggle" type="button" onclick="toggleTheme()" title="切换主题">🌓</button>
+  <div class="header-actions">
+    <a class="button secondary" href="/downloads/">下载目录</a>
+    <button class="icon-button secondary" type="button" onclick="location.reload()" aria-label="刷新" title="刷新">↻</button>
+    <button class="icon-button theme-toggle" type="button" onclick="toggleTheme()" aria-label="切换主题" title="切换主题">◐</button>
   </div>
 </header>
 {message_html}
-<div class="cards">
-  <div class="card">下载目录占用<strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
-  <div class="card">剩余磁盘空间<strong>{html.escape(str(stats["free_human"]))}</strong>
-    <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
+<div class="app-shell">
+  <div class="file-workspace">
+    <div class="status-strip">
+      <div class="status-item"><span>文件</span><strong>{len(files)}</strong></div>
+      <div class="status-item"><span>目录占用</span><strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
+      <div class="status-item"><span>剩余空间</span><strong>{html.escape(str(stats["free_human"]))}</strong>
+        <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
+      </div>
+      <div class="status-item"><span>默认保留</span><strong>{RETENTION_HOURS:g}h</strong></div>
+    </div>
+    <section class="file-section">
+      <div class="section-heading"><h2>可用文件</h2></div>
+      {render_file_rows(files, compact=True)}
+    </section>
+    <div class="site-note">
+      <p>文件按设定时间自动删除；一次性下载完整成功后立即删除。</p>
+      <p>仅用于合法资源临时中转。剩余空间低于 {format_size(MIN_FREE_BYTES)} 时会拒绝新任务。</p>
+    </div>
   </div>
-  <div class="card">文件数量<strong>{len(files)}</strong></div>
-  <div class="card">默认保留<strong>{RETENTION_HOURS:g}h</strong></div>
+  <nav class="admin-tool-rail" aria-label="管理员工具">
+    <button id="open-add-task" class="admin-tool-button" type="button" data-admin-modal="add-task-modal"
+            aria-controls="add-task-modal" aria-expanded="false" aria-label="添加链接" title="添加链接">
+      <span class="admin-tool-icon" aria-hidden="true">↗</span><span class="admin-tool-tooltip">添加链接</span>
+    </button>
+    <button id="open-upload" class="admin-tool-button" type="button" data-admin-modal="upload-modal"
+            aria-controls="upload-modal" aria-expanded="false" aria-label="上传文件" title="上传文件">
+      <span class="admin-tool-icon" aria-hidden="true">⇧</span><span class="admin-tool-tooltip">上传文件</span>
+    </button>
+    <button id="open-tasks" class="admin-tool-button" type="button" data-admin-modal="tasks-modal"
+            aria-controls="tasks-modal" aria-expanded="false" aria-label="下载任务：{html.escape(task_summary)}" title="下载任务">
+      <span class="admin-tool-icon" aria-hidden="true">≡</span><span class="admin-tool-tooltip">下载任务</span>
+    </button>
+  </nav>
 </div>
-<section>
-  <h2>可用文件</h2>
-  {render_file_rows(files, compact=True)}
-</section>
-<details>
-  <summary>下载任务状态</summary>
-  {render_task_rows(tasks)}
-</details>
-<details>
-  <summary>添加下载任务</summary>
-  <p>管理密码用于防止他人滥用下载任务，普通下载不需要密码。查看命令：<span class="code">cat data/admin_password.txt</span></p>
-  <form method="post" action="/api/add-task">
-    <label for="url">下载链接</label>
-    <input id="url" name="url" type="text" inputmode="url" placeholder="https://example.com/file.zip" required>
-    <div class="form-grid">
-      <div>
+<div id="add-task-modal" class="admin-modal-overlay" hidden aria-hidden="true">
+  <section class="admin-modal admin-modal-form" role="dialog" aria-modal="true" aria-labelledby="add-task-title">
+    <header class="admin-modal-header">
+      <h2 id="add-task-title">添加链接</h2>
+      <button class="admin-modal-close" type="button" data-close-admin-modal aria-label="关闭添加链接">×</button>
+    </header>
+    <div class="admin-modal-body">
+      <form method="post" action="/api/add-task">
+        <label for="url">下载链接</label>
+        <input id="url" name="url" type="text" inputmode="url" placeholder="https://example.com/file.zip" required>
         <label for="filename">自定义文件名（可选）</label>
         <input id="filename" name="filename" type="text" maxlength="180" placeholder="example.zip">
-      </div>
-      <div>
         {retention_select_html('task-retention')}
-      </div>
-      <div>
         <label for="password">管理密码</label>
         <input id="password" name="password" type="password" required>
-      </div>
+        <p class="muted">指定文件名后可设置保留时间。</p>
+        <input type="submit" value="添加任务">
+      </form>
     </div>
-    <p class="muted">文件名只允许中文、英文、数字、空格、点、下划线和短横线。保留时间仅在指定文件名时生效。</p>
-    <input type="submit" value="添加任务">
-  </form>
-</details>
-<details>
-  <summary>上传本地文件</summary>
-  <p>管理密码用于防止他人滥用上传功能，普通下载不需要密码。</p>
-  <form id="upload-form" method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="return handleUpload(this)">
-    <div id="drop-zone" class="drop-zone">
-      <p>📁 拖拽文件到这里，或点击选择文件</p>
-      <input id="upload-file" name="file" type="file" required>
-    </div>
-    <div id="drop-file-name" class="muted" style="margin:6px 0;font-size:13px;"></div>
-    <div class="form-grid">
-      <div>
+  </section>
+</div>
+<div id="upload-modal" class="admin-modal-overlay" hidden aria-hidden="true" data-busy="false">
+  <section class="admin-modal admin-modal-upload" role="dialog" aria-modal="true" aria-labelledby="upload-title">
+    <header class="admin-modal-header">
+      <h2 id="upload-title">上传文件</h2>
+      <button class="admin-modal-close" type="button" data-close-admin-modal aria-label="关闭上传文件">×</button>
+    </header>
+    <div class="admin-modal-body">
+      <form id="upload-form" method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="return handleUpload(this)">
+        <div id="drop-zone" class="drop-zone">
+          <span class="drop-icon" aria-hidden="true">▣</span>
+          <p>拖拽文件到这里，或点击选择文件</p>
+          <input id="upload-file" name="file" type="file" required>
+        </div>
+        <div id="drop-file-name" class="muted"></div>
         <label for="upload-filename">自定义文件名（可选）</label>
         <input id="upload-filename" name="filename" type="text" maxlength="180">
-      </div>
-      <div>
         {retention_select_html('upload-retention')}
-      </div>
-      <div>
         <label for="upload-password">管理密码</label>
         <input id="upload-password" name="password" type="password" required>
-      </div>
+        <p class="muted">单文件上限 {format_size(SINGLE_FILE_LIMIT_BYTES)}。</p>
+        <div class="form-submit"><input type="submit" value="上传"></div>
+        <div id="upload-progress" class="upload-progress">
+          <div class="upload-bar-outer"><div id="upload-bar" class="upload-bar-inner"></div></div>
+          <div id="upload-status" class="upload-status"></div>
+          <button id="upload-cancel" class="danger" type="button" hidden>取消上传</button>
+        </div>
+      </form>
     </div>
-    <p class="muted">文件名只允许中文、英文、数字、空格、点、下划线和短横线。单文件上限 {format_size(SINGLE_FILE_LIMIT_BYTES)}。</p>
-    <div class="form-submit"><input type="submit" value="上传"></div>
-    <div id="upload-progress" class="upload-progress">
-      <div class="upload-bar-outer"><div id="upload-bar" class="upload-bar-inner"></div></div>
-      <div id="upload-status" class="upload-status"></div>
+  </section>
+</div>
+<div id="tasks-modal" class="admin-modal-overlay" hidden aria-hidden="true">
+  <section class="admin-modal admin-modal-tasks" role="dialog" aria-modal="true" aria-labelledby="tasks-title">
+    <header class="admin-modal-header">
+      <div><h2 id="tasks-title">下载任务</h2><p>{html.escape(task_summary)}</p></div>
+      <button class="admin-modal-close" type="button" data-close-admin-modal aria-label="关闭下载任务">×</button>
+    </header>
+    <div class="admin-modal-body task-section">
+      {render_task_rows(tasks)}
     </div>
-  </form>
-</details>
-<div class="notice">
-  <p>文件按设定时间自动删除（可选1h/12h/24h/3d/7d）；一次性下载完整成功后立即删除。</p>
-  <p>仅用于合法资源临时中转。剩余空间低于 {format_size(MIN_FREE_BYTES)} 时会拒绝新任务。</p>
+  </section>
 </div>
 """
     return page("临时下载站", body)
@@ -1383,6 +1899,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
     def send_error_page(self, status: int, message: str) -> None:
         self.send_bytes(status, success_page(HTTPStatus(status).phrase, message))
 
+    def send_json(self, status: int, payload: dict[str, object]) -> None:
+        self.send_bytes(status, json_bytes(payload), "application/json; charset=utf-8")
+
     def normalized_path(self) -> str:
         raw_path = urllib.parse.urlsplit(self.path).path
         decoded = decode_path_segment(raw_path)
@@ -1465,11 +1984,14 @@ class DownloadHandler(BaseHTTPRequestHandler):
         if raw_path == "/api/upload_chunk":
             self.handle_upload_chunk()
             return
-        if raw_path == "/api/upload_finish":
-            self.handle_upload_finish()
-            return
         form = parse_form(self)
-        if raw_path == "/api/add-task":
+        if raw_path == "/api/upload_init":
+            self.handle_upload_init(form)
+        elif raw_path == "/api/upload_finish":
+            self.handle_upload_finish(form)
+        elif raw_path == "/api/upload_cancel":
+            self.handle_upload_cancel(form)
+        elif raw_path == "/api/add-task":
             self.handle_add_task(form)
         elif raw_path == "/api/remove-task":
             self.handle_remove_task(form)
@@ -1531,6 +2053,56 @@ class DownloadHandler(BaseHTTPRequestHandler):
             return
         self.send_bytes(200, success_page("续命成功", f"{filename} 的保留时间已重置。"))
 
+    def handle_upload_init(self, form: dict[str, str]) -> None:
+        if not check_admin_password(form.get("password", "")):
+            self.send_json(403, {"error": "管理密码错误"})
+            return
+        try:
+            filename = form.get("custom_filename", "").strip() or form.get("filename", "")
+            name = validate_custom_filename(filename)
+            size = int(form.get("size", "0") or "0")
+            retention = int(form.get("retention", "0") or "0")
+            if size <= 0:
+                raise ValueError("文件大小必须大于 0")
+            if retention and retention not in RETENTION_OPTIONS_SET:
+                raise ValueError("保留时间无效")
+            target = (DOWNLOADS_DIR / name).resolve()
+            target.relative_to(DOWNLOADS_DIR)
+            if target.exists():
+                self.send_json(409, {"error": "同名文件已存在，已拒绝覆盖"})
+                return
+            if size > SINGLE_FILE_LIMIT_BYTES:
+                self.send_json(413, {"error": f"上传文件超过单文件限制 {format_size(SINGLE_FILE_LIMIT_BYTES)}"})
+                return
+            ensure_upload_capacity(size)
+            session = create_upload_session(name, size, UPLOAD_CHUNK_BYTES, retention)
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self.send_json(413, {"error": str(exc)})
+            return
+        except Exception:
+            append_log("error.log", traceback.format_exc())
+            self.send_json(500, {"error": "创建上传任务失败"})
+            return
+        upload_id = str(session["upload_id"])
+        append_log(
+            "upload.log",
+            f"event=init upload_id={upload_id} name={urllib.parse.quote(name, safe='')} "
+            f"size={size} chunks={session['total_chunks']}",
+        )
+        self.send_json(
+            200,
+            {
+                "upload_id": upload_id,
+                "upload_token": session["upload_token"],
+                "chunk_size": session["chunk_size"],
+                "total_chunks": session["total_chunks"],
+                "concurrency": UPLOAD_CONCURRENCY,
+            },
+        )
+
     def handle_upload(self) -> None:
         """Streaming multipart upload — never buffers the full file in memory."""
         content_type = self.headers.get("Content-Type", "")
@@ -1540,6 +2112,13 @@ class DownloadHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0:
             self.send_error_page(400, "缺少 Content-Length")
+            return
+        if content_length > UPLOAD_FALLBACK_MAX_BYTES:
+            self.close_connection = True
+            self.send_error_page(
+                413,
+                f"传统上传最大支持 {format_size(UPLOAD_FALLBACK_MAX_BYTES)}，大文件请启用 JavaScript 分片上传",
+            )
             return
         bm = re.search(r'boundary=([^\s;]+)', content_type)
         if not bm:
@@ -1701,122 +2280,191 @@ class DownloadHandler(BaseHTTPRequestHandler):
                     tmp_path.unlink()
 
     def handle_upload_chunk(self) -> None:
+        started = time.monotonic()
+        body_consumed = False
         try:
             upload_id = self.headers.get("X-Upload-Id", "")
             chunk_index = int(self.headers.get("X-Chunk-Index", "-1"))
-            password = urllib.parse.unquote(self.headers.get("X-Password", ""))
-            
-            if not check_admin_password(password):
-                self.send_error_page(403, "管理密码错误")
-                return
-                
-            if not upload_id.isalnum() or len(upload_id) > 64 or chunk_index < 0:
-                self.send_error_page(400, "分片参数错误")
-                return
-                
-            ensure_can_store_new_file()
-            content_length = int(self.headers.get("Content-Length", "0"))
-            if content_length > 10 * 1024 * 1024:
-                self.send_error_page(413, "单分片过大")
-                return
-                
-            part_path = DOWNLOADS_DIR / f".upload-{upload_id}.tmp.part{chunk_index}"
-            
-            body = self.rfile.read(content_length)
-            if len(body) != content_length:
-                self.send_error_page(400, "网络中断导致数据不完整")
-                return
-                
-            with part_path.open("wb") as out:
-                out.write(body)
-                
-            self.send_bytes(200, b"OK")
-            
-        except Exception:
-            append_log("error.log", traceback.format_exc())
-            self.send_error_page(500, "上传分片处理异常")
+            upload_token = self.headers.get("X-Upload-Token", "")
+            validate_upload_id(upload_id)
+            lock = get_upload_lock(upload_id)
+            with lock:
+                try:
+                    session = load_upload_session(upload_id)
+                except FileNotFoundError:
+                    self.send_json(404, {"error": "上传任务不存在"})
+                    return
+                if not hmac.compare_digest(str(session["upload_token"]), upload_token):
+                    self.send_json(403, {"error": "上传任务凭证无效"})
+                    return
+                total_chunks = int(session["total_chunks"])
+                if chunk_index < 0 or chunk_index >= total_chunks:
+                    self.send_json(400, {"error": "分片编号超出范围"})
+                    return
+                size = int(session["size"])
+                chunk_size = int(session["chunk_size"])
+                offset = chunk_index * chunk_size
+                expected_length = min(chunk_size, size - offset)
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+                if content_length != expected_length:
+                    self.send_json(400, {"error": "分片长度与上传任务不一致"})
+                    return
 
-    def handle_upload_finish(self) -> None:
-        upload_id = ""
-        try:
-            upload_id = self.headers.get("X-Upload-Id", "")
-            total_chunks = int(self.headers.get("X-Total-Chunks", "-1"))
-            password = urllib.parse.unquote(self.headers.get("X-Password", ""))
-            
-            if not check_admin_password(password):
-                self.send_error_page(403, "管理密码错误")
-                return
-                
-            if not upload_id.isalnum() or len(upload_id) > 64 or total_chunks <= 0:
-                self.send_error_page(400, "参数错误")
-                return
-                
-            tmp_path = DOWNLOADS_DIR / f".upload-{upload_id}.tmp"
-            
-            with tmp_path.open("wb") as out:
-                for i in range(total_chunks):
-                    part_path = DOWNLOADS_DIR / f".upload-{upload_id}.tmp.part{i}"
-                    if not part_path.exists():
-                        with contextlib.suppress(OSError):
-                            tmp_path.unlink()
-                        self.send_error_page(400, f"分片 {i} 缺失")
-                        return
-                    with part_path.open("rb") as f:
-                        shutil.copyfileobj(f, out)
-                    with contextlib.suppress(OSError):
-                        part_path.unlink()
-                        
-            if tmp_path.stat().st_size > SINGLE_FILE_LIMIT_BYTES:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                self.send_error_page(400, f"文件超过上限 {format_size(SINGLE_FILE_LIMIT_BYTES)}")
-                return
-                
-            orig_name = urllib.parse.unquote(self.headers.get("X-Orig-Filename", ""))
-            custom_name = urllib.parse.unquote(self.headers.get("X-Filename", ""))
-            retention = int(self.headers.get("X-Retention", "0"))
-            
-            filename = custom_name if custom_name else orig_name
-            if not filename:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                self.send_error_page(400, "缺少文件名")
-                return
-                
-            name = validate_custom_filename(filename)
-            target = (DOWNLOADS_DIR / name).resolve()
-            
-            if target.exists():
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                raise FileExistsError("同名文件已存在，已拒绝覆盖")
-                
-            budget = MAX_DOWNLOAD_DIR_BYTES - get_downloads_usage()
-            if tmp_path.stat().st_size > budget:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                raise RuntimeError("磁盘空间不足")
-                
-            tmp_path.replace(target)
-            
-            with META_LOCK:
-                meta = load_meta()
-                entry: dict[str, float] = {"created_at": now_ts()}
-                if retention and retention in RETENTION_OPTIONS_SET:
-                    entry["retention_seconds"] = float(retention)
-                meta[name] = entry
-                save_meta(meta)
-            append_log("upload.log", f"uploaded name={name} size={target.stat().st_size}")
-            
-            self.send_bytes(200, b"OK")
-            
-        except FileExistsError as exc:
-            self.send_error_page(409, str(exc))
-        except (ValueError, RuntimeError) as exc:
-            self.send_error_page(400, f"合并失败：{exc}")
+                ensure_can_store_new_file()
+                remaining = content_length
+                written = 0
+                read_seconds = 0.0
+                write_seconds = 0.0
+                tmp_path = upload_tmp_path(upload_id)
+                with tmp_path.open("r+b") as out:
+                    out.seek(offset)
+                    while remaining > 0:
+                        read_started = time.monotonic()
+                        body = self.rfile.read(min(1024 * 1024, remaining))
+                        read_seconds += time.monotonic() - read_started
+                        if not body:
+                            self.send_json(400, {"error": "网络中断导致分片不完整"})
+                            return
+                        write_started = time.monotonic()
+                        out.write(body)
+                        write_seconds += time.monotonic() - write_started
+                        written += len(body)
+                        remaining -= len(body)
+                    body_consumed = True
+                    out.flush()
+
+                received = {int(index) for index in session["received_chunks"]}
+                received.add(chunk_index)
+                received_chunks = sorted(received)
+                received_bytes = sum(
+                    min(chunk_size, size - index * chunk_size) for index in received_chunks
+                )
+                session["received_chunks"] = received_chunks
+                session["received_bytes"] = received_bytes
+                session["updated_at"] = now_ts()
+                save_upload_session(session)
+
+            read_ms = round(read_seconds * 1000)
+            write_ms = round(write_seconds * 1000)
+            total_ms = round((time.monotonic() - started) * 1000)
+            append_log(
+                "upload.log",
+                f"event=chunk upload_id={upload_id} idx={chunk_index} bytes={written} "
+                f"read_ms={read_ms} write_ms={write_ms} total_ms={total_ms}",
+            )
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "received_chunks": len(received_chunks),
+                    "received_bytes": received_bytes,
+                },
+            )
+        except (TypeError, ValueError) as exc:
+            self.send_json(400, {"error": str(exc) or "分片参数错误"})
+        except RuntimeError as exc:
+            self.send_json(413, {"error": str(exc)})
         except Exception:
             append_log("error.log", traceback.format_exc())
-            self.send_error_page(500, "合并处理异常")
+            self.send_json(500, {"error": "上传分片处理异常"})
+        finally:
+            if not body_consumed:
+                self.close_connection = True
+
+    def handle_upload_finish(self, form: dict[str, str]) -> None:
+        started = time.monotonic()
+        upload_id = form.get("upload_id", "")
+        renamed = False
+        try:
+            validate_upload_id(upload_id)
+            lock = get_upload_lock(upload_id)
+            with lock:
+                try:
+                    session = load_upload_session(upload_id)
+                except FileNotFoundError:
+                    self.send_json(404, {"error": "上传任务不存在"})
+                    return
+                if not hmac.compare_digest(
+                    str(session["upload_token"]), form.get("upload_token", "")
+                ):
+                    self.send_json(403, {"error": "上传任务凭证无效"})
+                    return
+                total_chunks = int(session["total_chunks"])
+                received = {int(index) for index in session["received_chunks"]}
+                missing = [index for index in range(total_chunks) if index not in received]
+                if missing:
+                    self.send_json(400, {"error": f"分片 {missing[0]} 缺失"})
+                    return
+                tmp_path = upload_tmp_path(upload_id)
+                size = int(session["size"])
+                if not tmp_path.exists() or tmp_path.stat().st_size != size:
+                    self.send_json(400, {"error": "临时文件大小与上传任务不一致"})
+                    return
+                name = str(session["filename"])
+                target = (DOWNLOADS_DIR / name).resolve()
+                target.relative_to(DOWNLOADS_DIR)
+                if target.exists():
+                    self.send_json(409, {"error": "同名文件已存在，已拒绝覆盖"})
+                    return
+                rename_started = time.monotonic()
+                tmp_path.replace(target)
+                rename_ms = round((time.monotonic() - rename_started) * 1000)
+                renamed = True
+
+                with META_LOCK:
+                    meta = load_meta()
+                    entry: dict[str, float] = {"created_at": now_ts()}
+                    retention = int(session["retention_seconds"])
+                    if retention:
+                        entry["retention_seconds"] = float(retention)
+                    meta[name] = entry
+                    save_meta(meta)
+                remove_upload_session(upload_id, remove_tmp=False)
+                with UPLOAD_LOCKS_GUARD:
+                    UPLOAD_LOCKS.pop(upload_id, None)
+
+            total_ms = round((time.monotonic() - started) * 1000)
+            append_log(
+                "upload.log",
+                f"event=finish upload_id={upload_id} size={size} "
+                f"rename_ms={rename_ms} total_ms={total_ms}",
+            )
+            self.send_json(200, {"ok": True, "filename": name, "url": "/downloads/"})
+        except (TypeError, ValueError) as exc:
+            self.send_json(400, {"error": str(exc) or "完成上传参数错误"})
+        except Exception:
+            append_log("error.log", traceback.format_exc())
+            if renamed:
+                with contextlib.suppress(OSError):
+                    upload_session_path(upload_id).unlink()
+            self.send_json(500, {"error": "完成上传处理异常"})
+
+    def handle_upload_cancel(self, form: dict[str, str]) -> None:
+        upload_id = form.get("upload_id", "")
+        try:
+            validate_upload_id(upload_id)
+            lock = get_upload_lock(upload_id)
+            with lock:
+                try:
+                    session = load_upload_session(upload_id)
+                except FileNotFoundError:
+                    self.send_json(200, {"ok": True})
+                    return
+                if not hmac.compare_digest(
+                    str(session["upload_token"]), form.get("upload_token", "")
+                ):
+                    self.send_json(403, {"error": "上传任务凭证无效"})
+                    return
+                remove_upload_session(upload_id)
+            with UPLOAD_LOCKS_GUARD:
+                UPLOAD_LOCKS.pop(upload_id, None)
+            append_log("upload.log", f"event=cancel upload_id={upload_id} reason=user")
+            self.send_json(200, {"ok": True})
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except Exception:
+            append_log("error.log", traceback.format_exc())
+            self.send_json(500, {"error": "取消上传处理异常"})
 
     def handle_file(self, encoded_name: str, head_only: bool) -> None:
         try:
