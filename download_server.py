@@ -245,6 +245,8 @@ def load_meta() -> dict[str, dict[str, float]]:
                 entry: dict[str, float] = {"created_at": float(item["created_at"])}
                 if "retention_seconds" in item:
                     entry["retention_seconds"] = float(item["retention_seconds"])
+                if "download_count" in item:
+                    entry["download_count"] = float(max(0, int(item["download_count"])))
                 result[name] = entry
             except (KeyError, TypeError, ValueError):
                 continue
@@ -257,6 +259,23 @@ def save_meta(meta: dict[str, dict[str, float]]) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2, sort_keys=True)
     tmp_path.replace(META_PATH)
+
+
+def increment_download_count(filename: str) -> int:
+    with META_LOCK:
+        meta = load_meta()
+        entry = meta.get(filename)
+        if entry is None:
+            path = DOWNLOADS_DIR / filename
+            if not path.exists():
+                return 0
+            entry = {"created_at": now_ts()}
+            meta[filename] = entry
+        count = max(0, int(entry.get("download_count", 0))) + 1
+        entry["download_count"] = float(count)
+        save_meta(meta)
+    append_log("download.log", f"completed name={filename} count={count}")
+    return count
 
 
 def load_task_retentions() -> dict[str, int]:
@@ -508,6 +527,7 @@ def scan_files() -> list[dict[str, object]]:
                 "expires_at_text": format_time(expires_at),
                 "remaining_text": format_remaining(expires_at),
                 "retention_label": format_retention(ret_secs),
+                "download_count": max(0, int(entry.get("download_count", 0))),
                 "file_type": file_type(name),
                 "url_name": urllib.parse.quote(name),
             }
@@ -924,6 +944,7 @@ def stream_once_file(path: Path, write_chunk, chunk_size: int = 1024 * 128) -> N
         completed = True
     finally:
         if completed:
+            count = increment_download_count(name)
             with contextlib.suppress(OSError):
                 path.unlink()
             with META_LOCK:
@@ -931,7 +952,7 @@ def stream_once_file(path: Path, write_chunk, chunk_size: int = 1024 * 128) -> N
                 if name in meta:
                     meta.pop(name, None)
                     save_meta(meta)
-            append_log("once-download.log", f"completed removed={name}")
+            append_log("once-download.log", f"completed removed={name} count={count}")
         else:
             append_log("once-download.log", f"interrupted kept={name}")
 
@@ -1132,14 +1153,9 @@ def page(title: str, body: str) -> bytes:
     .header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
     .icon-button { width: 40px; height: 40px; padding: 0; display: inline-grid; place-items: center; font-size: 20px; }
     .theme-toggle { border: 1px solid var(--line); color: var(--text); }
-    .app-shell { display: grid; grid-template-columns: 64px minmax(0, 1fr); grid-template-areas: "tools files"; gap: 12px; align-items: start; }
-    .file-workspace { grid-area: files; min-width: 0; padding: 0; }
-    .admin-tool-rail { grid-area: tools; position: sticky; top: 16px; z-index: 30; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); box-shadow: 0 6px 18px rgba(15, 23, 42, .08); }
-    .admin-tool-button { position: relative; width: 46px; height: 46px; padding: 0; display: grid; place-items: center; border-radius: 6px; background: transparent; color: var(--text); }
-    .admin-tool-button:hover, .admin-tool-button[aria-expanded="true"] { background: var(--primary); color: #fff; }
+    .app-shell { display: block; }
+    .file-workspace { min-width: 0; padding: 0; }
     .admin-tool-icon { font-size: 25px; line-height: 1; }
-    .admin-tool-tooltip { position: absolute; left: calc(100% + 12px); top: 50%; transform: translateY(-50%); width: max-content; max-width: 180px; padding: 6px 9px; border-radius: 4px; background: #1f2933; color: #fff; font-size: 12px; font-weight: 600; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .15s; }
-    .admin-tool-button:hover .admin-tool-tooltip, .admin-tool-button:focus-visible .admin-tool-tooltip { opacity: 1; visibility: visible; }
     body.admin-modal-open { overflow: hidden; }
     .admin-modal-overlay { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 23, 42, .58); }
     .admin-modal-overlay[hidden] { display: none; }
@@ -1156,11 +1172,11 @@ def page(title: str, body: str) -> bytes:
     .field-with-action textarea { min-height: 110px; resize: vertical; }
     .field-action { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; font-size: 22px; }
     input:disabled { opacity: .65; cursor: not-allowed; }
-    .status-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); overflow: hidden; }
-    .status-item { min-width: 0; padding: 12px; border-right: 1px solid var(--line); }
-    .status-item:last-child { border-right: 0; }
-    .status-item > span { display: block; color: var(--muted); font-size: 12px; }
-    .status-item strong { display: block; margin-top: 4px; font-size: 17px; overflow-wrap: anywhere; }
+    .status-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .status-item { min-width: 0; min-height: 128px; padding: 20px 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); }
+    .status-item > span { display: block; color: var(--text); font-size: 16px; font-weight: 650; }
+    .status-item strong { display: block; margin-top: 14px; color: var(--primary); font-size: 30px; line-height: 1.05; overflow-wrap: anywhere; }
+    .status-item .disk-bar-outer { margin-top: 18px; }
     .disk-bar-outer { height: 6px; }
     .disk-bar-inner { background: #2f855a; }
     .disk-bar-inner.warn { background: #d69e2e; }
@@ -1171,6 +1187,9 @@ def page(title: str, body: str) -> bytes:
     .section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .section-heading h2 { margin: 0; }
     .section-heading p { margin: 3px 0 0; font-size: 12px; }
+    .file-tools { display: flex; align-items: center; gap: 7px; }
+    .file-tool-button { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; background: var(--primary); color: #fff; }
+    .file-tool-button:hover, .file-tool-button[aria-expanded="true"] { background: var(--primary-dark); color: #fff; }
     .task-list { border-top: 1px solid var(--line); }
     .task-item { padding: 12px 0; border-bottom: 1px solid var(--line); }
     .task-primary { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
@@ -1179,6 +1198,7 @@ def page(title: str, body: str) -> bytes:
     .task-progress-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; margin-top: 9px; }
     .task-progress-row .progress { width: 100%; margin: 0; }
     .task-percent { color: var(--muted); font-size: 12px; }
+    .task-complete { margin-top: 9px; padding: 8px 10px; border-left: 3px solid #2f855a; background: rgba(47, 133, 90, .1); color: #2f855a; font-size: 13px; font-weight: 700; }
     .task-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 7px; color: var(--muted); font-size: 12px; }
     .task-remove-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-top: 9px; }
     .task-remove-form input[type=password] { min-width: 0; }
@@ -1229,20 +1249,16 @@ def page(title: str, body: str) -> bytes:
       html:not(.light) .menu-command:hover { background: #2b343d; }
     }
     @media (max-width: 900px) {
-      main { width: min(calc(100% - 24px), 720px); padding: 12px 0 104px; }
+      main { width: min(calc(100% - 24px), 720px); padding: 12px 0 40px; }
       .site-header { align-items: flex-start; }
       .app-shell { display: block; }
       .file-workspace { width: 100%; }
       .workspace-columns { grid-template-columns: minmax(0, 1fr); }
       .task-panel { position: static; max-height: none; }
-      .admin-tool-rail { position: fixed; top: auto; right: 50%; bottom: 12px; z-index: 900; flex-direction: row; width: max-content; transform: translateX(50%); padding: 7px; box-shadow: 0 10px 30px rgba(15, 23, 42, .22); }
-      .admin-tool-tooltip { display: none; }
-      .file-menu-panel { position: fixed; top: auto; right: 12px; bottom: 88px; z-index: 950; max-height: calc(100vh - 112px); overflow-y: auto; }
+      .file-menu-panel { position: fixed; top: auto; right: 12px; bottom: 12px; z-index: 950; max-height: calc(100vh - 36px); overflow-y: auto; }
       .admin-modal-overlay { padding: 16px 3vw; }
       .admin-modal, .admin-modal-upload { width: 94vw; max-height: 88vh; }
-      .status-strip { grid-template-columns: 1fr 1fr; }
-      .status-item:nth-child(2) { border-right: 0; }
-      .status-item:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .status-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .file-table thead { display: none; }
       .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); }
       .file-row:last-child { border-bottom: 0; }
@@ -1253,8 +1269,7 @@ def page(title: str, body: str) -> bytes:
       .site-header { flex-wrap: wrap; }
       .header-actions { width: 100%; justify-content: flex-start; }
       .status-strip { grid-template-columns: 1fr; }
-      .status-item { border-right: 0; border-bottom: 1px solid var(--line); }
-      .status-item:last-child { border-bottom: 0; }
+      .status-item { min-height: 112px; }
       .file-row { grid-template-columns: 1fr; }
       .file-actions { justify-content: flex-start; padding-left: 42px; }
     }
@@ -1292,6 +1307,31 @@ def page(title: str, body: str) -> bytes:
       var payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '\u8bf7\u6c42\u5931\u8d25');
       return payload;
+    }
+    var taskRefreshTimer = null;
+    var taskRefreshBusy = false;
+    function scheduleTaskRefresh(delay) {
+      clearTimeout(taskRefreshTimer);
+      taskRefreshTimer = setTimeout(function() { refreshTaskPanel(); }, delay);
+    }
+    async function refreshTaskPanel() {
+      if (taskRefreshBusy) return;
+      var body = document.getElementById('task-panel-body');
+      var summary = document.getElementById('task-summary');
+      if (!body || !summary) return;
+      taskRefreshBusy = true;
+      try {
+        var response = await fetch('/api/task-panel', {cache: 'no-store'});
+        var payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || '\u5237\u65b0\u4efb\u52a1\u5931\u8d25');
+        body.innerHTML = payload.html;
+        summary.textContent = payload.summary;
+        scheduleTaskRefresh(payload.poll ? 3000 : 30000);
+      } catch (error) {
+        scheduleTaskRefresh(15000);
+      } finally {
+        taskRefreshBusy = false;
+      }
     }
     async function initUpload(form, file, retention) {
       return postFormJson('/api/upload_init', {
@@ -1338,6 +1378,7 @@ def page(title: str, body: str) -> bytes:
           filename: urls.length === 1 ? form.querySelector('[name=filename]').value : '',
           retention: form.querySelector('[name=retention]').value
         });
+        await refreshTaskPanel();
         closeActiveAdminModal();
         form.reset();
         updateTaskFilenameAvailability();
@@ -1693,6 +1734,7 @@ def page(title: str, body: str) -> bytes:
       closeActiveAdminModal();
       if (openButton) openButton.focus();
     });
+    scheduleTaskRefresh(3000);
     """
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
@@ -1799,6 +1841,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<span>{html.escape(str(item["size_human"]))}</span>'
             f'<span>入库 {html.escape(str(item["created_at_text"]))}</span>'
             f'<span class="file-remaining">剩余 {html.escape(str(item["remaining_text"]))}</span>'
+            f'<span>下载 {max(0, int(item.get("download_count", 0)))} 次</span>'
             f'<span class="tag">{ret_label}</span>'
             '</div></div></div></td>'
             f'<td class="file-actions">{actions}</td>'
@@ -1826,15 +1869,31 @@ def render_task_rows(task_data: dict[str, object]) -> str:
         gid = html.escape(str(task["gid"]))
         hint = f'<div class="muted">{html.escape(str(task["hint"]))}</div>' if task.get("hint") else ""
         progress = float(task["progress"])
-        status = html.escape(str(task["status"]))
+        raw_status = str(task["status"])
+        status_labels = {
+            "active": "下载中",
+            "waiting": "等待中",
+            "paused": "已暂停",
+            "complete": "已完成",
+            "error": "失败",
+            "removed": "已移除",
+        }
+        status = html.escape(status_labels.get(raw_status, raw_status))
+        progress_html = (
+            '<div class="task-complete">已完成</div>'
+            if raw_status == "complete"
+            else (
+                '<div class="task-progress-row">'
+                f'<div class="progress"><div class="bar" style="width:{min(progress, 100):.1f}%"></div></div>'
+                f'<span class="task-percent">{progress:.1f}%</span></div>'
+            )
+        )
         rows.append(
             '<article class="task-item">'
             '<div class="task-primary">'
             f'<div class="task-name code">{html.escape(str(task["name"]))}{hint}</div>'
             f'<span class="tag task-status">{status}</span></div>'
-            '<div class="task-progress-row">'
-            f'<div class="progress"><div class="bar" style="width:{min(progress, 100):.1f}%"></div></div>'
-            f'<span class="task-percent">{progress:.1f}%</span></div>'
+            f'{progress_html}'
             '<div class="task-meta">'
             f"<span>{html.escape(str(task['speed_human']))}</span>"
             f"<span>{html.escape(str(task['completed_human']))} / {html.escape(str(task['total_human']))}</span>"
@@ -1854,15 +1913,32 @@ def render_task_rows(task_data: dict[str, object]) -> str:
     return f'<div class="task-list">{"".join(rows)}</div>{clear_form}'
 
 
+def task_panel_payload(task_data: dict[str, object] | None = None) -> dict[str, object]:
+    data = task_data if task_data is not None else get_aria2_tasks()
+    items = data.get("tasks") if isinstance(data, dict) else []
+    tasks = items if isinstance(items, list) else []
+    ok = bool(data.get("ok")) if isinstance(data, dict) else False
+    summary = f"{len(tasks)} 个任务" if ok else "状态不可用"
+    poll = any(
+        isinstance(task, dict) and str(task.get("status", "")) in {"active", "waiting", "paused"}
+        for task in tasks
+    )
+    return {
+        "ok": ok,
+        "summary": summary,
+        "html": render_task_rows(data if isinstance(data, dict) else {"ok": False}),
+        "poll": poll,
+    }
+
+
 def render_home(message: str = "") -> bytes:
     cleanup_expired()
     tasks = get_aria2_tasks()
     files = scan_files()
     stats = get_disk_stats()
-    task_items = tasks.get("tasks") if isinstance(tasks, dict) else []
-    task_count = len(task_items) if isinstance(task_items, list) else 0
-    tasks_ok = bool(tasks.get("ok")) if isinstance(tasks, dict) else False
-    task_summary = f"{task_count} 个任务" if tasks_ok else "状态不可用"
+    task_panel = task_panel_payload(tasks)
+    task_summary = str(task_panel["summary"])
+    task_html = str(task_panel["html"])
     message_html = f'<div class="notice">{html.escape(message)}</div>' if message else ""
     body = f"""
 <header class="site-header">
@@ -1879,24 +1955,35 @@ def render_home(message: str = "") -> bytes:
 <div class="app-shell">
   <div class="file-workspace">
     <div class="status-strip">
-      <div class="status-item"><span>文件</span><strong>{len(files)}</strong></div>
-      <div class="status-item"><span>目录占用</span><strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
-      <div class="status-item"><span>剩余空间</span><strong>{html.escape(str(stats["free_human"]))}</strong>
+      <div class="status-item"><span>下载目录占用</span><strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
+      <div class="status-item"><span>剩余磁盘空间</span><strong>{html.escape(str(stats["free_human"]))}</strong>
         <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
       </div>
-      <div class="status-item"><span>默认保留</span><strong>{RETENTION_HOURS:g}h</strong></div>
+      <div class="status-item"><span>文件数量</span><strong>{len(files)}</strong></div>
     </div>
     <div class="workspace-columns">
       <section class="file-section">
-        <div class="section-heading"><h2>可用文件</h2></div>
+        <div class="section-heading">
+          <h2>可用文件</h2>
+          <div class="file-tools" aria-label="文件工具">
+            <button id="open-add-task" class="file-tool-button" type="button" data-admin-modal="add-task-modal"
+                    aria-controls="add-task-modal" aria-expanded="false" aria-label="添加链接" title="添加链接">
+              <span class="admin-tool-icon" aria-hidden="true">+</span>
+            </button>
+            <button id="open-upload" class="file-tool-button" type="button" data-admin-modal="upload-modal"
+                    aria-controls="upload-modal" aria-expanded="false" aria-label="上传文件" title="上传文件">
+              <span class="admin-tool-icon" aria-hidden="true">⇧</span>
+            </button>
+          </div>
+        </div>
         {render_file_rows(files, compact=True)}
       </section>
       <section class="task-panel">
         <div class="section-heading">
-          <div><h2>下载任务</h2><p>{html.escape(task_summary)}</p></div>
-          <button class="icon-button secondary" type="button" onclick="location.reload()" aria-label="刷新任务" title="刷新任务">↻</button>
+          <div><h2>下载任务</h2><p id="task-summary">{html.escape(task_summary)}</p></div>
+          <button id="refresh-tasks" class="icon-button secondary" type="button" onclick="refreshTaskPanel()" aria-label="刷新任务" title="刷新任务">↻</button>
         </div>
-        {render_task_rows(tasks)}
+        <div id="task-panel-body">{task_html}</div>
       </section>
     </div>
     <div class="site-note">
@@ -1904,16 +1991,6 @@ def render_home(message: str = "") -> bytes:
       <p>仅用于合法资源临时中转。剩余空间低于 {format_size(MIN_FREE_BYTES)} 时会拒绝新任务。</p>
     </div>
   </div>
-  <nav class="admin-tool-rail" aria-label="管理员工具">
-    <button id="open-add-task" class="admin-tool-button" type="button" data-admin-modal="add-task-modal"
-            aria-controls="add-task-modal" aria-expanded="false" aria-label="添加链接" title="添加链接">
-      <span class="admin-tool-icon" aria-hidden="true">+</span><span class="admin-tool-tooltip">添加链接</span>
-    </button>
-    <button id="open-upload" class="admin-tool-button" type="button" data-admin-modal="upload-modal"
-            aria-controls="upload-modal" aria-expanded="false" aria-label="上传文件" title="上传文件">
-      <span class="admin-tool-icon" aria-hidden="true">⇧</span><span class="admin-tool-tooltip">上传文件</span>
-    </button>
-  </nav>
 </div>
 <div id="add-task-modal" class="admin-modal-overlay" hidden aria-hidden="true">
   <section class="admin-modal admin-modal-form" role="dialog" aria-modal="true" aria-labelledby="add-task-title">
@@ -2132,6 +2209,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_bytes(200, json_bytes(scan_files()), "application/json; charset=utf-8")
         elif raw_path == "/api/tasks":
             self.send_bytes(200, json_bytes(get_aria2_tasks()), "application/json; charset=utf-8")
+        elif raw_path == "/api/task-panel":
+            self.send_json(200, task_panel_payload())
         elif raw_path.startswith("/view/"):
             self.handle_view(raw_path.removeprefix("/view/"))
         elif raw_path.startswith("/media/"):
@@ -2695,6 +2774,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
             return
         with path.open("rb") as f:
             shutil.copyfileobj(f, self.wfile)
+        increment_download_count(path.name)
 
     def handle_view(self, encoded_name: str) -> None:
         try:

@@ -539,7 +539,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn("&lt;bad&amp;&quot;.txt", body)
         self.assertIn('data-filename="&lt;bad&amp;&quot;.txt"', body)
 
-    def test_home_renders_file_and_task_workspace_without_legacy_downloads_page(self):
+    def test_home_renders_status_cards_and_file_toolbar_without_legacy_sidebar(self):
         tasks = {
             "ok": True,
             "tasks": [
@@ -562,11 +562,11 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             'class="app-shell"',
             'class="file-workspace"',
             'class="status-strip"',
-            'class="admin-tool-rail"',
             'class="workspace-columns"',
             'class="task-panel"',
             'class="task-list"',
             'class="task-item"',
+            'class="file-tools"',
             'id="open-add-task"',
             'id="open-upload"',
             'aria-controls="add-task-modal"',
@@ -599,10 +599,55 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('onsubmit="handleAddTasks(this); return false"', body)
         self.assertNotIn('onsubmit="return handleAddTasks(this)"', body)
         self.assertIn('<span class="admin-tool-icon" aria-hidden="true">+</span>', body)
+        self.assertEqual(body.count('class="status-item"'), 3)
+        self.assertNotIn('class="admin-tool-rail"', body)
         self.assertNotIn('href="/downloads/"', body)
         self.assertNotIn('id="open-tasks"', body)
         self.assertNotIn('id="tasks-modal"', body)
         self.assertLess(body.index('class="file-section"'), body.index('class="task-panel"'))
+        self.assertLess(body.index('<h2>可用文件</h2>'), body.index('id="open-add-task"'))
+
+    def test_task_panel_payload_polls_running_tasks_and_marks_completed_tasks(self):
+        active = {
+            "ok": True,
+            "tasks": [{
+                "gid": "a1", "name": "active.bin", "hint": "", "status": "active",
+                "progress": 50.0, "speed_human": "1 MiB/s",
+                "completed_human": "1 MiB", "total_human": "2 MiB",
+            }],
+        }
+        complete = {
+            "ok": True,
+            "tasks": [{
+                "gid": "b2", "name": "done.bin", "hint": "", "status": "complete",
+                "progress": 100.0, "speed_human": "0 B/s",
+                "completed_human": "2 MiB", "total_human": "2 MiB",
+            }],
+        }
+
+        active_payload = self.ds.task_panel_payload(active)
+        complete_payload = self.ds.task_panel_payload(complete)
+
+        self.assertTrue(active_payload["poll"])
+        self.assertIn('class="progress"', active_payload["html"])
+        self.assertFalse(complete_payload["poll"])
+        self.assertIn("已完成", complete_payload["html"])
+        self.assertNotIn('class="progress"', complete_payload["html"])
+
+    def test_task_panel_api_returns_refreshable_html(self):
+        server, thread, base = self.start_test_server()
+        try:
+            with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+                with urllib.request.urlopen(f"{base}/api/task-panel", timeout=3) as response:
+                    status = response.status
+                    payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(status, 200)
+            self.assertIn("暂无下载任务", payload["html"])
+            self.assertFalse(payload["poll"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_legacy_downloads_page_redirects_to_home(self):
         server, thread, base = self.start_test_server()
@@ -686,20 +731,18 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
-    def test_page_includes_responsive_icon_rail_modals_and_file_menu(self):
+    def test_page_includes_responsive_workspace_modals_and_file_menu(self):
         body = self.ds.render_home().decode("utf-8")
 
         for css_or_script in (
-            "grid-template-areas",
-            "64px minmax(0, 1fr)",
+            ".workspace-columns",
+            "minmax(0, 1.45fr)",
             "@media (max-width: 900px)",
             ".file-type-icon",
             "font-size: 28px",
-            ".admin-tool-rail",
             ".admin-modal-overlay",
             "max-height: 88vh",
             "bottom: 12px",
-            "bottom: 88px",
             "function toggleFileMenu",
             "function closeFileMenus",
             "aria-expanded",
@@ -727,16 +770,20 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "navigator.clipboard.readText()",
             "document.getElementById('upload-retention').value",
             "function renewFile",
+            "function refreshTaskPanel",
+            "scheduleTaskRefresh",
+            "await refreshTaskPanel()",
         ):
             self.assertIn(script_marker, body)
 
-    def test_mobile_admin_tool_rail_follows_file_workspace(self):
+    def test_mobile_workspace_stacks_tasks_after_files_without_fixed_toolbar(self):
         body = self.ds.render_home().decode("utf-8")
 
         self.assertLess(
-            body.index('class="file-workspace"'),
-            body.index('class="admin-tool-rail"'),
+            body.index('class="file-section"'),
+            body.index('class="task-panel"'),
         )
+        self.assertNotIn('class="admin-tool-rail"', body)
 
     def test_page_avoids_oversized_radii_and_legacy_purple_gradient(self):
         body = self.ds.render_home().decode("utf-8")
@@ -791,6 +838,63 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         file_path.unlink()
         self.assertEqual(self.ds.scan_files(), [])
         self.assertEqual(self.ds.load_meta(), {})
+
+    def test_file_metadata_preserves_and_renders_download_count(self):
+        target = self.ds.DOWNLOADS_DIR / "counted.txt"
+        target.write_text("hello", encoding="utf-8")
+        self.ds.save_meta({
+            target.name: {
+                "created_at": self.ds.now_ts(),
+                "retention_seconds": 86400.0,
+                "download_count": 3.0,
+            }
+        })
+
+        files = self.ds.scan_files()
+        body = self.ds.render_file_rows(files, compact=True)
+
+        self.assertEqual(files[0]["download_count"], 3)
+        self.assertIn("下载 3 次", body)
+
+    def test_full_file_download_increments_count_but_head_does_not(self):
+        target = self.ds.DOWNLOADS_DIR / "counter.bin"
+        target.write_bytes(b"abcdef")
+        self.ds.save_meta({target.name: {"created_at": self.ds.now_ts(), "download_count": 0.0}})
+        server, thread, base = self.start_test_server()
+        try:
+            head = urllib.request.Request(f"{base}/file/{target.name}", method="HEAD")
+            with urllib.request.urlopen(head, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(self.ds.load_meta()[target.name]["download_count"], 0.0)
+
+            with urllib.request.urlopen(f"{base}/file/{target.name}", timeout=3) as response:
+                self.assertEqual(response.read(), b"abcdef")
+            for _ in range(50):
+                if self.ds.load_meta()[target.name].get("download_count") == 1.0:
+                    break
+                self.ds.time.sleep(0.01)
+            self.assertEqual(self.ds.load_meta()[target.name]["download_count"], 1.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_interrupted_file_download_does_not_increment_count(self):
+        target = self.ds.DOWNLOADS_DIR / "interrupted.bin"
+        target.write_bytes(b"abcdef")
+        self.ds.save_meta({target.name: {"created_at": self.ds.now_ts(), "download_count": 2.0}})
+        handler = object.__new__(self.ds.DownloadHandler)
+        handler.command = "GET"
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.wfile = mock.Mock()
+        handler.wfile.write.side_effect = ConnectionError("client closed")
+
+        with self.assertRaises(ConnectionError):
+            handler.handle_file(target.name, head_only=False)
+
+        self.assertEqual(self.ds.load_meta()[target.name]["download_count"], 2.0)
 
     def test_cleanup_expired_removes_old_files_and_logs(self):
         now = 1_700_100_000.0
