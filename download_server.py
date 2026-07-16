@@ -71,6 +71,7 @@ RETENTION_OPTIONS = [
     (604800, "7 天"),
 ]
 RETENTION_OPTIONS_SET = {v for v, _ in RETENTION_OPTIONS}
+MAX_BATCH_TASKS = 20
 BANNED_PREFIXES = (
     "/.git",
     "/logs",
@@ -706,6 +707,15 @@ def add_aria2_task(url: str, filename: str | None = None, retention_seconds: int
     return result
 
 
+def parse_task_urls(raw_urls: str) -> list[str]:
+    urls = list(dict.fromkeys(line.strip() for line in raw_urls.splitlines() if line.strip()))
+    if not urls:
+        raise ValueError("请输入下载链接")
+    if len(urls) > MAX_BATCH_TASKS:
+        raise ValueError(f"每次最多添加 {MAX_BATCH_TASKS} 个链接")
+    return [validate_task_url(url) for url in urls]
+
+
 def remove_aria2_task(gid: str) -> None:
     if not re.fullmatch(r"[0-9a-fA-F]{1,32}", gid or ""):
         raise ValueError("非法 GID")
@@ -930,8 +940,8 @@ def page(title: str, body: str) -> bytes:
     .viewer img, .viewer video { display: block; width: 100%; max-height: 72vh; object-fit: contain; border-radius: 6px; background: #0f172a; }
     form.inline { display: inline; }
     label { display: block; font-weight: 650; margin: 10px 0 5px; font-size: 14px; }
-    input[type=text], input[type=password], input[type=url], select { width: 100%; border: 1px solid var(--input-border); border-radius: 8px; padding: 10px; font: inherit; background: var(--input-bg); color: var(--text); transition: border-color .15s, box-shadow .15s; }
-    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(23, 105, 170, 0.14); }
+    input[type=text], input[type=password], input[type=url], textarea, select { width: 100%; border: 1px solid var(--input-border); border-radius: 8px; padding: 10px; font: inherit; background: var(--input-bg); color: var(--text); transition: border-color .15s, box-shadow .15s; }
+    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus, textarea:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(23, 105, 170, 0.14); }
     input[type=file] { width: 100%; border: 2px dashed var(--line); border-radius: 8px; padding: 18px 12px; font: inherit; cursor: pointer; background: var(--file-bg); color: var(--text); transition: border-color .2s, background .2s; }
     input[type=file]:hover, input[type=file]:focus { border-color: var(--primary); background: #eef5fa; }
     .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
@@ -966,7 +976,7 @@ def page(title: str, body: str) -> bytes:
     .upload-bar-outer { width: 100%; height: 10px; background: #eef0f6; border-radius: 999px; overflow: hidden; }
     .upload-bar-inner { height: 100%; width: 0%; background: var(--primary); border-radius: 999px; transition: width .2s; }
     .upload-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
-    .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 999; }
+    .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px); background: #1f2430; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; z-index: 1200; }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
     html.dark { color-scheme: dark; --bg: #14181d; --text: #e7ebef; --muted: #9aa6b2; --line: #333b44; --primary: #4da3df; --primary-dark: #2987c7; --card-bg: #1d232a; --input-bg: #161b21; --input-border: #46515d; --file-bg: #252c34; }
     html.dark .card:hover { box-shadow: 0 4px 12px rgba(77, 163, 223, 0.15); }
@@ -1027,6 +1037,10 @@ def page(title: str, body: str) -> bytes:
     .admin-modal-close { flex: 0 0 40px; width: 40px; height: 40px; padding: 0; display: grid; place-items: center; background: transparent; color: var(--text); font-size: 24px; line-height: 1; }
     .admin-modal-close:hover { background: var(--line); color: var(--text); }
     .admin-modal input[type=submit] { width: 100%; }
+    .field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 8px; align-items: start; }
+    .field-with-action textarea { min-height: 110px; resize: vertical; }
+    .field-action { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; font-size: 22px; }
+    input:disabled { opacity: .65; cursor: not-allowed; }
     .task-section { overflow-x: auto; }
     .task-section table { min-width: 680px; font-size: 12px; }
     .task-section input[type=password] { min-width: 110px; }
@@ -1149,14 +1163,62 @@ def page(title: str, body: str) -> bytes:
       if (!response.ok) throw new Error(payload.error || '\u8bf7\u6c42\u5931\u8d25');
       return payload;
     }
-    async function initUpload(form, file) {
+    async function initUpload(form, file, retention) {
       return postFormJson('/api/upload_init', {
         password: form.querySelector('[name=password]').value,
         filename: file.name,
         custom_filename: (form.querySelector('[name=filename]') || {}).value || '',
         size: String(file.size),
-        retention: (form.querySelector('[name=retention]') || {}).value || '0'
+        retention: retention || '0'
       });
+    }
+    function taskUrlLines(value) {
+      return value.split(/\\r?\\n/).map(function(line) { return line.trim(); }).filter(Boolean);
+    }
+    function updateTaskFilenameAvailability() {
+      var urls = document.getElementById('url');
+      var filename = document.getElementById('filename');
+      if (!urls || !filename) return;
+      var isBatch = taskUrlLines(urls.value).length > 1;
+      filename.disabled = isBatch;
+      filename.title = isBatch ? '\u6279\u91cf\u6dfb\u52a0\u65f6\u4e0d\u652f\u6301\u81ea\u5b9a\u4e49\u6587\u4ef6\u540d' : '';
+    }
+    async function pasteTaskUrls() {
+      var input = document.getElementById('url');
+      if (!input) return;
+      try {
+        var text = (await navigator.clipboard.readText()).trim();
+        if (!text) throw new Error('\u526a\u8d34\u677f\u4e3a\u7a7a');
+        input.value = input.value.trim() ? input.value.trim() + '\\n' + text : text;
+        updateTaskFilenameAvailability();
+        input.focus();
+      } catch (error) {
+        showToast(error.message || '\u65e0\u6cd5\u8bfb\u53d6\u526a\u8d34\u677f');
+      }
+    }
+    async function handleAddTasks(form) {
+      var submit = form.querySelector('input[type=submit]');
+      var urls = taskUrlLines(form.querySelector('[name=url]').value);
+      submit.disabled = true;
+      submit.value = '\u6dfb\u52a0\u4e2d...';
+      try {
+        var payload = await postFormJson('/api/add-task', {
+          password: form.querySelector('[name=password]').value,
+          url: urls.join('\\n'),
+          filename: urls.length === 1 ? form.querySelector('[name=filename]').value : '',
+          retention: form.querySelector('[name=retention]').value
+        });
+        closeActiveAdminModal();
+        form.reset();
+        updateTaskFilenameAvailability();
+        showToast(payload.message || '\u4efb\u52a1\u5df2\u6dfb\u52a0');
+      } catch (error) {
+        showToast(error.message || '\u6dfb\u52a0\u4efb\u52a1\u5931\u8d25');
+      } finally {
+        submit.disabled = false;
+        submit.value = '\u6dfb\u52a0\u4efb\u52a1';
+      }
+      return false;
     }
     async function finishUpload(session) {
       return postFormJson('/api/upload_finish', {
@@ -1236,7 +1298,8 @@ def page(title: str, body: str) -> bytes:
       submit.disabled = true;
       submit.value = '\u4e0a\u4f20\u4e2d...';
       try {
-        session = await initUpload(form, file);
+        var selectedRetention = document.getElementById('upload-retention').value;
+        session = await initUpload(form, file, selectedRetention);
         cancel.hidden = false;
         state.loaded = new Array(session.total_chunks).fill(0);
         state.render = function() {
@@ -1711,15 +1774,19 @@ def render_home(message: str = "") -> bytes:
       <button class="admin-modal-close" type="button" data-close-admin-modal aria-label="关闭添加链接">×</button>
     </header>
     <div class="admin-modal-body">
-      <form method="post" action="/api/add-task">
-        <label for="url">下载链接</label>
-        <input id="url" name="url" type="text" inputmode="url" placeholder="https://example.com/file.zip" required>
+      <form id="add-task-form" method="post" action="/api/add-task" onsubmit="handleAddTasks(this); return false">
+        <label for="url">下载链接（每行一个）</label>
+        <div class="field-with-action">
+          <textarea id="url" name="url" inputmode="url" rows="5" placeholder="https://example.com/file.zip" oninput="updateTaskFilenameAvailability()" required></textarea>
+          <button id="paste-task-urls" class="secondary field-action" type="button" onclick="pasteTaskUrls()" aria-label="粘贴链接" title="粘贴链接">⎘</button>
+        </div>
+        <p class="muted">一次最多添加 {MAX_BATCH_TASKS} 个链接。</p>
         <label for="filename">自定义文件名（可选）</label>
         <input id="filename" name="filename" type="text" maxlength="180" placeholder="example.zip">
         {retention_select_html('task-retention')}
         <label for="password">管理密码</label>
         <input id="password" name="password" type="password" required>
-        <p class="muted">指定文件名后可设置保留时间。</p>
+        <p class="muted">自定义文件名仅适用于单个链接；批量任务使用默认文件名。</p>
         <input type="submit" value="添加任务">
       </form>
     </div>
@@ -1732,7 +1799,7 @@ def render_home(message: str = "") -> bytes:
       <button class="admin-modal-close" type="button" data-close-admin-modal aria-label="关闭上传文件">×</button>
     </header>
     <div class="admin-modal-body">
-      <form id="upload-form" method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="return handleUpload(this)">
+      <form id="upload-form" method="post" action="/api/upload" enctype="multipart/form-data" onsubmit="handleUpload(this); return false">
         <div id="drop-zone" class="drop-zone">
           <span class="drop-icon" aria-hidden="true">▣</span>
           <p>拖拽文件到这里，或点击选择文件</p>
@@ -2004,16 +2071,41 @@ class DownloadHandler(BaseHTTPRequestHandler):
 
     def handle_add_task(self, form: dict[str, str]) -> None:
         if not check_admin_password(form.get("password", "")):
-            self.send_error_page(403, "管理密码错误")
+            self.send_json(403, {"error": "管理密码错误"})
             return
         try:
+            urls = parse_task_urls(form.get("url", ""))
             filename = form.get("filename", "").strip() or None
             retention = int(form.get("retention", "0") or "0")
-            gid = add_aria2_task(form.get("url", ""), filename, retention)
+            if retention and retention not in RETENTION_OPTIONS_SET:
+                raise ValueError("保留时间无效")
+            if len(urls) > 1 and filename:
+                raise ValueError("批量添加时不能设置自定义文件名")
         except Exception as exc:
-            self.send_error_page(400, f"添加任务失败：{exc}")
+            self.send_json(400, {"error": f"添加任务失败：{exc}"})
             return
-        self.send_bytes(200, success_page("任务已添加", f"GID: {gid}"))
+
+        gids: list[str] = []
+        errors: list[str] = []
+        for url in urls:
+            try:
+                gids.append(add_aria2_task(url, filename, retention))
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+        if not gids:
+            self.send_json(400, {"error": f"添加任务失败：{errors[0]}", "added": 0, "total": len(urls)})
+            return
+        message = f"已添加 {len(gids)} 个任务"
+        if errors:
+            message += f"，{len(errors)} 个失败"
+        self.send_json(200, {
+            "ok": True,
+            "message": message,
+            "added": len(gids),
+            "total": len(urls),
+            "gids": gids,
+            "errors": errors,
+        })
 
     def handle_remove_task(self, form: dict[str, str]) -> None:
         if not check_admin_password(form.get("password", "")):

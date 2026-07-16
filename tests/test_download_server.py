@@ -211,7 +211,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
                     "filename": "original.bin",
                     "custom_filename": "final.bin",
                     "size": "9",
-                    "retention": "86400",
+                    "retention": "604800",
                 })
             self.assertEqual(status, 200)
             self.assertEqual(payload["chunk_size"], 4)
@@ -221,7 +221,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertTrue(payload["upload_token"])
             session = self.ds.load_upload_session(payload["upload_id"])
             self.assertEqual(session["filename"], "final.bin")
-            self.assertEqual(session["retention_seconds"], 86400)
+            self.assertEqual(session["retention_seconds"], 604800)
         finally:
             server.shutdown()
             server.server_close()
@@ -343,8 +343,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
-    def test_upload_finish_renames_and_writes_meta(self):
-        session = self.ds.create_upload_session("final.bin", 9, 4, 86400)
+    def test_upload_finish_renames_and_writes_seven_day_meta(self):
+        session = self.ds.create_upload_session("final.bin", 9, 4, 604800)
         server, thread, base = self.start_test_server()
         try:
             self.post_upload_chunk(base, session, 0, b"ABCD")
@@ -360,7 +360,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertEqual((self.ds.DOWNLOADS_DIR / "final.bin").read_bytes(), b"ABCDEFGHI")
             self.assertFalse(self.ds.upload_tmp_path(session["upload_id"]).exists())
             self.assertFalse(self.ds.upload_session_path(session["upload_id"]).exists())
-            self.assertEqual(self.ds.load_meta()["final.bin"]["retention_seconds"], 86400.0)
+            self.assertEqual(self.ds.load_meta()["final.bin"]["retention_seconds"], 604800.0)
+            files = self.ds.scan_files()
+            self.assertEqual(files[0]["retention_label"], "7d")
+            self.assertGreater(files[0]["expires_at"] - self.ds.now_ts(), 604790)
         finally:
             server.shutdown()
             server.server_close()
@@ -450,11 +453,13 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn("[1000, 3000]", body)
         self.assertIn('id="upload-cancel"', body)
         self.assertIn("activeXhrs", body)
+        self.assertIn('onsubmit="handleUpload(this); return false"', body)
+        self.assertNotIn('onsubmit="return handleUpload(this)"', body)
         self.assertNotIn("Math.random()", body)
         self.assertNotIn("X-Password", body)
         self.assertGreater(
             body.index("cancel.hidden = false"),
-            body.index("session = await initUpload(form, file)"),
+            body.index("session = await initUpload(form, file, selectedRetention)"),
         )
 
     def test_file_rows_render_icons_primary_actions_and_more_menu(self):
@@ -548,6 +553,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
         for field in (
             'id="url"',
+            'id="paste-task-urls"',
             'id="filename"',
             'id="task-retention"',
             'id="password"',
@@ -560,6 +566,54 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
         self.assertIn("hello &lt;world&gt;", body)
         self.assertNotIn("hello <world>", body)
+        self.assertIn('onsubmit="handleAddTasks(this); return false"', body)
+        self.assertNotIn('onsubmit="return handleAddTasks(this)"', body)
+
+    def test_add_task_api_accepts_multiple_urls_and_returns_json(self):
+        server, thread, base = self.start_test_server()
+        try:
+            with (
+                mock.patch.object(self.ds, "check_admin_password", return_value=True),
+                mock.patch.object(self.ds, "add_aria2_task", side_effect=["gid-a", "gid-b"]) as add_task,
+            ):
+                status, payload = self.post_form_json(base, "/api/add-task", {
+                    "password": "good-password",
+                    "url": "https://example.com/a.zip\nhttps://example.com/b.zip",
+                    "filename": "",
+                    "retention": "604800",
+                })
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["added"], 2)
+            self.assertEqual(payload["total"], 2)
+            self.assertEqual(payload["gids"], ["gid-a", "gid-b"])
+            self.assertEqual(add_task.call_args_list, [
+                mock.call("https://example.com/a.zip", None, 604800),
+                mock.call("https://example.com/b.zip", None, 604800),
+            ])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_add_task_api_rejects_filename_for_multiple_urls(self):
+        server, thread, base = self.start_test_server()
+        try:
+            with mock.patch.object(self.ds, "check_admin_password", return_value=True):
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    self.post_form_json(base, "/api/add-task", {
+                        "password": "good-password",
+                        "url": "https://example.com/a.zip\nhttps://example.com/b.zip",
+                        "filename": "same.zip",
+                        "retention": "86400",
+                    })
+            self.assertEqual(error.exception.code, 400)
+            payload = json.loads(error.exception.read().decode("utf-8"))
+            self.assertIn("批量", payload["error"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_page_includes_responsive_icon_rail_modals_and_file_menu(self):
         body = self.ds.render_home().decode("utf-8")
@@ -597,6 +651,9 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "uploadModal.dataset.busy = 'false'",
             "[data-close-admin-modal]",
             "[data-admin-modal]",
+            "function handleAddTasks",
+            "navigator.clipboard.readText()",
+            "document.getElementById('upload-retention').value",
         ):
             self.assertIn(script_marker, body)
 
