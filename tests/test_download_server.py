@@ -383,6 +383,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
             self.assertEqual(status, 200)
             self.assertTrue(payload["ok"])
+            self.assertEqual(payload["url"], "/")
             self.assertEqual((self.ds.DOWNLOADS_DIR / "final.bin").read_bytes(), b"ABCDEFGHI")
             self.assertFalse(self.ds.upload_tmp_path(session["upload_id"]).exists())
             self.assertFalse(self.ds.upload_session_path(session["upload_id"]).exists())
@@ -538,7 +539,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn("&lt;bad&amp;&quot;.txt", body)
         self.assertIn('data-filename="&lt;bad&amp;&quot;.txt"', body)
 
-    def test_home_renders_icon_rail_modals_without_losing_admin_features(self):
+    def test_home_renders_file_and_task_workspace_without_legacy_downloads_page(self):
         tasks = {
             "ok": True,
             "tasks": [
@@ -562,15 +563,16 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             'class="file-workspace"',
             'class="status-strip"',
             'class="admin-tool-rail"',
+            'class="workspace-columns"',
+            'class="task-panel"',
+            'class="task-list"',
+            'class="task-item"',
             'id="open-add-task"',
             'id="open-upload"',
-            'id="open-tasks"',
             'aria-controls="add-task-modal"',
             'aria-controls="upload-modal"',
-            'aria-controls="tasks-modal"',
             'id="add-task-modal"',
             'id="upload-modal"',
-            'id="tasks-modal"',
             'action="/api/add-task"',
             'id="upload-form"',
             'action="/api/remove-task"',
@@ -596,6 +598,25 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertNotIn("hello <world>", body)
         self.assertIn('onsubmit="handleAddTasks(this); return false"', body)
         self.assertNotIn('onsubmit="return handleAddTasks(this)"', body)
+        self.assertIn('<span class="admin-tool-icon" aria-hidden="true">+</span>', body)
+        self.assertNotIn('href="/downloads/"', body)
+        self.assertNotIn('id="open-tasks"', body)
+        self.assertNotIn('id="tasks-modal"', body)
+        self.assertLess(body.index('class="file-section"'), body.index('class="task-panel"'))
+
+    def test_legacy_downloads_page_redirects_to_home(self):
+        server, thread, base = self.start_test_server()
+        try:
+            with urllib.request.urlopen(f"{base}/downloads/", timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.geturl(), f"{base}/")
+                body = response.read().decode("utf-8")
+            self.assertIn("临时下载站", body)
+            self.assertNotIn("<h1>下载目录</h1>", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_add_task_api_accepts_multiple_urls_and_returns_json(self):
         server, thread, base = self.start_test_server()
@@ -862,6 +883,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertIn("<img", body)
             self.assertIn("/media/picture.png", body)
             self.assertNotIn("<video", body)
+            self.assertIn('href="/">返回文件列表</a>', body)
+            self.assertNotIn('href="/downloads/"', body)
         finally:
             server.shutdown()
             server.server_close()

@@ -47,7 +47,7 @@ python -B -m unittest tests.test_download_server -v
 - finish 缺片拒绝、最终 rename、元数据写入和 cancel 幂等清理。
 - 上传临时占用、过期会话清理和传统 multipart 读取前 413 拒绝。
 - 首页渲染 upload v2 初始化、token、重试、取消和服务端配置客户端。
-- 首页 A1 图标栏、居中管理弹窗、完整管理员字段、文件图标和更多菜单。
+- 首页 A1 图标栏、居中管理弹窗、文件/任务双栏、完整管理员字段、文件图标和更多菜单。
 - 添加链接 AJAX 提示、剪贴板入口、批量链接校验与 JSON 响应。
 - 未指定文件名的链接任务通过 GID 在完成后保留所选期限。
 - 续期无需密码并返回 JSON。
@@ -75,13 +75,13 @@ curl.exe -s http://127.0.0.1:18081/
 
 结果：HTML 包含 `临时下载站`，核心数据由 SSR 输出。
 
-下载目录：
+旧下载目录兼容重定向：
 
 ```bash
-curl.exe -s http://127.0.0.1:18081/downloads/
+curl.exe -I http://127.0.0.1:18081/downloads/
 ```
 
-结果：HTML 包含 `下载目录`，测试文件显示在表格中。
+结果：返回 `302`，`Location: /`。
 
 API：
 
@@ -151,7 +151,7 @@ curl.exe -s http://127.0.0.1:18081/once/probe.txt -H "Range: bytes=0-1"
 ss -tlnp | grep 8081
 ss -tlnp | grep 6800
 curl -s http://127.0.0.1:8081/ | grep "临时下载站"
-curl -s http://127.0.0.1:8081/downloads/ | grep "下载目录"
+curl -I http://127.0.0.1:8081/downloads/ | grep -i "location: /"
 curl -s http://127.0.0.1:8081/api/stats
 curl -s http://127.0.0.1:8081/api/files
 curl -s http://127.0.0.1:8081/api/tasks
@@ -171,7 +171,7 @@ curl -s -X POST http://127.0.0.1:8081/api/add-task \
 
 ```bash
 ls -lh downloads/
-curl -s http://127.0.0.1:8081/downloads/ | grep "test-1mb.bin"
+curl -s http://127.0.0.1:8081/ | grep "test-1mb.bin"
 curl -I http://127.0.0.1:8081/file/test-1mb.bin
 ```
 
@@ -206,9 +206,9 @@ tail -f logs/upload.log
 
 使用以下视口检查首页：
 
-- `1440x900`：左侧 64px 图标栏，右侧文件区；三个入口分别打开页面中央弹窗。
-- `1024x768`：图标栏和文件区保持稳定，状态条和文件操作不重叠。
-- `390x844`：文件区先出现，三个管理入口固定在底部且不遮挡内容。
+- `1440x900`：左侧 64px 图标栏，文件列表与下载任务并排，两个管理入口打开中央弹窗。
+- `1024x768`：文件/任务双栏保持稳定，状态条和文件操作不重叠。
+- `390x844`：文件区先出现，任务区随后出现，两个管理入口固定在底部且不遮挡内容。
 
 每个视口覆盖：
 
