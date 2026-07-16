@@ -115,6 +115,32 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.ds.UPLOADS_DIR,
         )
 
+    def test_link_task_without_custom_filename_remembers_retention_by_gid(self):
+        with (
+            mock.patch.object(self.ds, "ensure_can_add_task"),
+            mock.patch.object(self.ds, "aria2_rpc", return_value="abc123"),
+        ):
+            gid = self.ds.add_aria2_task("https://example.com/photo.avif", None, 604800)
+
+        self.assertEqual(gid, "abc123")
+        self.assertEqual(self.ds.load_task_retentions(), {"abc123": 604800})
+
+    def test_completed_link_task_applies_pending_retention_to_actual_filename(self):
+        target = self.ds.DOWNLOADS_DIR / "resolved-name.avif"
+        target.write_bytes(b"image")
+        self.ds.save_task_retentions({"abc123": 604800})
+        task = {
+            "gid": "abc123",
+            "status": "complete",
+            "files": [{"path": str(target)}],
+        }
+
+        self.ds.sync_task_retentions([task])
+
+        self.assertEqual(self.ds.load_meta()[target.name]["retention_seconds"], 604800.0)
+        self.assertEqual(self.ds.load_task_retentions(), {})
+        self.assertEqual(self.ds.scan_files()[0]["retention_label"], "7d")
+
     def test_load_upload_session_rejects_invalid_id(self):
         for upload_id in ("../bad", "bad/slash", "", "a" * 65):
             with self.subTest(upload_id=upload_id):
@@ -485,7 +511,9 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('class="file-menu-toggle', body)
         self.assertIn('data-url="/file/clip.mp4"', body)
         self.assertIn('href="/once/clip.mp4"', body)
-        self.assertIn('action="/api/renew"', body)
+        self.assertIn('class="menu-command renew-btn"', body)
+        self.assertIn('data-filename="clip.mp4"', body)
+        self.assertNotIn('name="password"', body)
         self.assertIn('aria-expanded="false"', body)
         self.assertIn('id="filter-empty"', body)
         self.assertIn("filterFiles('video', this)", body)
@@ -508,7 +536,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
         self.assertNotIn('<bad&".txt', body)
         self.assertIn("&lt;bad&amp;&quot;.txt", body)
-        self.assertIn('value="&lt;bad&amp;&quot;.txt"', body)
+        self.assertIn('data-filename="&lt;bad&amp;&quot;.txt"', body)
 
     def test_home_renders_icon_rail_modals_without_losing_admin_features(self):
         tasks = {
@@ -615,6 +643,28 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_renew_api_requires_no_password_and_returns_updated_remaining_time(self):
+        target = self.ds.DOWNLOADS_DIR / "renew.txt"
+        target.write_text("hello", encoding="utf-8")
+        self.ds.save_meta({
+            target.name: {
+                "created_at": self.ds.now_ts() - 3600,
+                "retention_seconds": 604800.0,
+            }
+        })
+        server, thread, base = self.start_test_server()
+        try:
+            status, payload = self.post_form_json(base, "/api/renew", {"filename": target.name})
+
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["ok"])
+            self.assertIn("小时", payload["remaining"])
+            self.assertGreater(self.ds.load_meta()[target.name]["created_at"], self.ds.now_ts() - 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_page_includes_responsive_icon_rail_modals_and_file_menu(self):
         body = self.ds.render_home().decode("utf-8")
 
@@ -628,6 +678,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             ".admin-modal-overlay",
             "max-height: 88vh",
             "bottom: 12px",
+            "bottom: 88px",
             "function toggleFileMenu",
             "function closeFileMenus",
             "aria-expanded",
@@ -654,6 +705,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "function handleAddTasks",
             "navigator.clipboard.readText()",
             "document.getElementById('upload-retention').value",
+            "function renewFile",
         ):
             self.assertIn(script_marker, body)
 

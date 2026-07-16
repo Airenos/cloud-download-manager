@@ -27,10 +27,12 @@ import threading
 
 APP_ROOT = Path(os.environ.get("APP_ROOT", Path(__file__).resolve().parent)).resolve()
 META_LOCK = threading.RLock()
+TASK_RETENTION_LOCK = threading.RLock()
 DOWNLOADS_DIR = (APP_ROOT / "downloads").resolve()
 LOGS_DIR = (APP_ROOT / "logs").resolve()
 DATA_DIR = (APP_ROOT / "data").resolve()
 META_PATH = DATA_DIR / "filemeta.json"
+TASK_RETENTION_PATH = DATA_DIR / "task_retention.json"
 UPLOADS_DIR = (DATA_DIR / "uploads").resolve()
 ADMIN_PASSWORD_PATH = DATA_DIR / "admin_password.txt"
 ARIA2_SECRET_PATH = DATA_DIR / "aria2_rpc_secret.txt"
@@ -255,6 +257,56 @@ def save_meta(meta: dict[str, dict[str, float]]) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2, sort_keys=True)
     tmp_path.replace(META_PATH)
+
+
+def load_task_retentions() -> dict[str, int]:
+    ensure_directories()
+    if not TASK_RETENTION_PATH.exists():
+        return {}
+    try:
+        with TASK_RETENTION_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        gid: retention
+        for gid, retention in data.items()
+        if isinstance(gid, str)
+        and re.fullmatch(r"[0-9a-fA-F]{1,32}", gid)
+        and type(retention) is int
+        and retention in RETENTION_OPTIONS_SET
+    }
+
+
+def save_task_retentions(retentions: dict[str, int]) -> None:
+    ensure_directories()
+    if not retentions:
+        with contextlib.suppress(FileNotFoundError):
+            TASK_RETENTION_PATH.unlink()
+        return
+    tmp_path = TASK_RETENTION_PATH.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(retentions, f, ensure_ascii=False, indent=2, sort_keys=True)
+    tmp_path.replace(TASK_RETENTION_PATH)
+
+
+def remember_task_retention(gid: str, retention_seconds: int) -> None:
+    if retention_seconds not in RETENTION_OPTIONS_SET:
+        return
+    with TASK_RETENTION_LOCK:
+        pending = load_task_retentions()
+        pending[gid] = retention_seconds
+        save_task_retentions(pending)
+
+
+def forget_task_retention(gid: str) -> None:
+    with TASK_RETENTION_LOCK:
+        pending = load_task_retentions()
+        if gid in pending:
+            pending.pop(gid, None)
+            save_task_retentions(pending)
 
 
 def validate_upload_id(upload_id: str) -> str:
@@ -506,9 +558,7 @@ def cleanup_expired() -> list[str]:
     return removed
 
 
-def renew_file(filename: str, password: str) -> None:
-    if not check_admin_password(password):
-        raise PermissionError("管理密码错误")
+def renew_file(filename: str) -> float:
     with META_LOCK:
         meta = load_meta()
         if filename not in meta:
@@ -519,8 +569,11 @@ def renew_file(filename: str, password: str) -> None:
             save_meta(meta)
             raise FileNotFoundError("文件不存在或已过期")
         meta[filename]["created_at"] = now_ts()
+        retention = meta[filename].get("retention_seconds", RETENTION_SECONDS)
+        expires_at = meta[filename]["created_at"] + retention
         save_meta(meta)
     append_log("renew.log", f"renewed name={filename}")
+    return expires_at
 
 
 def validate_custom_filename(filename: str) -> str:
@@ -704,6 +757,8 @@ def add_aria2_task(url: str, filename: str | None = None, retention_seconds: int
             if out_name not in meta:
                 meta[out_name] = {"created_at": now_ts(), "retention_seconds": float(retention_seconds)}
                 save_meta(meta)
+    elif retention_seconds and retention_seconds in RETENTION_OPTIONS_SET:
+        remember_task_retention(result, retention_seconds)
     return result
 
 
@@ -777,6 +832,65 @@ def normalize_task(task: dict[str, object]) -> dict[str, object]:
     }
 
 
+def sync_task_retentions(tasks: list[object]) -> None:
+    task_map = {
+        str(task.get("gid")): task
+        for task in tasks
+        if isinstance(task, dict) and task.get("gid")
+    }
+    with TASK_RETENTION_LOCK:
+        pending = load_task_retentions()
+        if not pending:
+            return
+        completed: list[tuple[str, int, list[str]]] = []
+        discarded: set[str] = set()
+        for gid, retention in pending.items():
+            task = task_map.get(gid)
+            if not task:
+                continue
+            status = str(task.get("status", ""))
+            if status in {"error", "removed"}:
+                discarded.add(gid)
+                continue
+            if status != "complete":
+                continue
+            names: list[str] = []
+            files = task.get("files")
+            if isinstance(files, list):
+                for item in files:
+                    if not isinstance(item, dict) or not item.get("path"):
+                        continue
+                    path = Path(str(item["path"]))
+                    if not path.is_absolute():
+                        path = DOWNLOADS_DIR / path
+                    path = path.resolve()
+                    try:
+                        path.relative_to(DOWNLOADS_DIR)
+                    except ValueError:
+                        continue
+                    if path.parent == DOWNLOADS_DIR and is_visible_download(path):
+                        names.append(path.name)
+            if names:
+                completed.append((gid, retention, list(dict.fromkeys(names))))
+
+        if completed:
+            with META_LOCK:
+                meta = load_meta()
+                created_at = now_ts()
+                for gid, retention, names in completed:
+                    for name in names:
+                        meta[name] = {
+                            "created_at": created_at,
+                            "retention_seconds": float(retention),
+                        }
+                    discarded.add(gid)
+                save_meta(meta)
+        if discarded:
+            for gid in discarded:
+                pending.pop(gid, None)
+            save_task_retentions(pending)
+
+
 def get_aria2_tasks() -> dict[str, object]:
     try:
         active = aria2_rpc("aria2.tellActive") or []
@@ -784,6 +898,8 @@ def get_aria2_tasks() -> dict[str, object]:
         stopped = aria2_rpc("aria2.tellStopped", [0, 10]) or []
     except Exception as exc:
         return {"ok": False, "error": str(exc), "active": [], "waiting": [], "stopped": [], "tasks": []}
+    all_tasks = [*active, *waiting, *stopped]
+    sync_task_retentions(all_tasks)
     result = {
         "ok": True,
         "error": "",
@@ -1078,8 +1194,7 @@ def page(title: str, body: str) -> bytes:
     .menu-command { display: block; width: 100%; padding: 9px 10px; border-radius: 4px; text-align: left; background: transparent; color: var(--text); font-weight: 600; }
     .menu-command:hover { background: var(--file-bg); color: var(--text); }
     .danger-text { color: #b4232c; }
-    .renew-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; padding-top: 6px; }
-    .renew-form input[type=password] { min-width: 0; }
+    .renew-btn:disabled { opacity: .65; cursor: wait; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     .filter-empty { display: none; padding: 24px 16px; color: var(--muted); text-align: center; }
     .filter-empty.visible { display: block; }
@@ -1108,6 +1223,7 @@ def page(title: str, body: str) -> bytes:
       .file-workspace { width: 100%; }
       .admin-tool-rail { position: fixed; top: auto; right: 50%; bottom: 12px; z-index: 900; flex-direction: row; width: max-content; transform: translateX(50%); padding: 7px; box-shadow: 0 10px 30px rgba(15, 23, 42, .22); }
       .admin-tool-tooltip { display: none; }
+      .file-menu-panel { position: fixed; top: auto; right: 12px; bottom: 88px; z-index: 950; max-height: calc(100vh - 112px); overflow-y: auto; }
       .admin-modal-overlay { padding: 16px 3vw; }
       .admin-modal, .admin-modal-upload, .admin-modal-tasks { width: 94vw; max-height: 88vh; }
       .status-strip { grid-template-columns: 1fr 1fr; }
@@ -1510,6 +1626,22 @@ def page(title: str, body: str) -> bytes:
       var m = document.getElementById('share-modal');
       if (m) m.classList.remove('active');
     }
+    async function renewFile(button) {
+      if (!button || button.disabled) return;
+      button.disabled = true;
+      try {
+        var payload = await postFormJson('/api/renew', {filename: button.dataset.filename});
+        var row = button.closest('.file-row');
+        var remaining = row && row.querySelector('.file-remaining');
+        if (remaining) remaining.textContent = '\u5269\u4f59 ' + payload.remaining;
+        closeFileMenus();
+        showToast(payload.message || '\u7eed\u671f\u6210\u529f');
+      } catch (error) {
+        showToast(error.message || '\u7eed\u671f\u5931\u8d25');
+      } finally {
+        button.disabled = false;
+      }
+    }
     document.addEventListener('click', function(e) {
       var adminTrigger = e.target.closest && e.target.closest('[data-admin-modal]');
       if (adminTrigger) {
@@ -1622,13 +1754,9 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             if kind else ""
         )
         ret_label = html.escape(str(item.get("retention_label", "")))
-        renew_form = (
-            '<form class="renew-form" method="post" action="/api/renew">'
-            f'<input type="hidden" name="filename" value="{safe_name_attr}">'
-            f'<label class="sr-only" for="renew-password-{index}">管理密码</label>'
-            f'<input id="renew-password-{index}" type="password" name="password" '
-            'placeholder="管理密码" required>'
-            '<button class="secondary" type="submit">续期</button></form>'
+        renew_button = (
+            '<button class="menu-command renew-btn" type="button" '
+            f'data-filename="{safe_name_attr}" onclick="renewFile(this)">续期</button>'
         )
         more_menu = (
             '<div class="file-menu">'
@@ -1639,7 +1767,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<button class="share-btn menu-command" type="button" '
             f'data-url="/file/{url_name}" data-name="{safe_name_attr}">二维码分享</button>'
             f'<a class="menu-command danger-text" href="/once/{url_name}">一次性下载</a>'
-            f'{renew_form}</div></div>'
+            f'{renew_button}</div></div>'
         )
         actions = (
             preview
@@ -1656,7 +1784,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             '<div class="file-meta">'
             f'<span>{html.escape(str(item["size_human"]))}</span>'
             f'<span>入库 {html.escape(str(item["created_at_text"]))}</span>'
-            f'<span>剩余 {html.escape(str(item["remaining_text"]))}</span>'
+            f'<span class="file-remaining">剩余 {html.escape(str(item["remaining_text"]))}</span>'
             f'<span class="tag">{ret_label}</span>'
             '</div></div></div></td>'
             f'<td class="file-actions">{actions}</td>'
@@ -1712,9 +1840,9 @@ def render_task_rows(task_data: dict[str, object]) -> str:
 
 def render_home(message: str = "") -> bytes:
     cleanup_expired()
+    tasks = get_aria2_tasks()
     files = scan_files()
     stats = get_disk_stats()
-    tasks = get_aria2_tasks()
     task_items = tasks.get("tasks") if isinstance(tasks, dict) else []
     task_count = len(task_items) if isinstance(task_items, list) else 0
     tasks_ok = bool(tasks.get("ok")) if isinstance(tasks, dict) else False
@@ -1839,6 +1967,7 @@ def render_home(message: str = "") -> bytes:
 
 def render_downloads() -> bytes:
     cleanup_expired()
+    get_aria2_tasks()
     files = scan_files()
     stats = get_disk_stats()
     body = f"""
@@ -2019,6 +2148,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
         elif raw_path == "/api/stats":
             self.send_bytes(200, json_bytes(get_disk_stats()), "application/json; charset=utf-8")
         elif raw_path == "/api/files":
+            get_aria2_tasks()
             self.send_bytes(200, json_bytes(scan_files()), "application/json; charset=utf-8")
         elif raw_path == "/api/tasks":
             self.send_bytes(200, json_bytes(get_aria2_tasks()), "application/json; charset=utf-8")
@@ -2112,7 +2242,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_error_page(403, "管理密码错误")
             return
         try:
-            remove_aria2_task(form.get("gid", ""))
+            gid = form.get("gid", "")
+            remove_aria2_task(gid)
+            forget_task_retention(gid)
         except Exception as exc:
             self.send_error_page(400, f"删除任务失败：{exc}")
             return
@@ -2131,19 +2263,19 @@ class DownloadHandler(BaseHTTPRequestHandler):
 
     def handle_renew(self, form: dict[str, str]) -> None:
         filename = form.get("filename", "").strip()
-        password = form.get("password", "")
         try:
-            renew_file(filename, password)
-        except PermissionError:
-            self.send_error_page(403, "管理密码错误")
-            return
+            expires_at = renew_file(filename)
         except FileNotFoundError as exc:
-            self.send_error_page(404, str(exc))
+            self.send_json(404, {"error": str(exc)})
             return
         except Exception as exc:
-            self.send_error_page(400, f"续命失败：{exc}")
+            self.send_json(400, {"error": f"续期失败：{exc}"})
             return
-        self.send_bytes(200, success_page("续命成功", f"{filename} 的保留时间已重置。"))
+        self.send_json(200, {
+            "ok": True,
+            "message": "续期成功",
+            "remaining": format_remaining(expires_at),
+        })
 
     def handle_upload_init(self, form: dict[str, str]) -> None:
         if not check_admin_password(form.get("password", "")):
