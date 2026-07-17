@@ -1201,15 +1201,18 @@ def page(title: str, body: str) -> bytes:
     .disk-bar-inner.warn { background: #d69e2e; }
     .disk-bar-inner.danger { background: #d64545; }
     .workspace-columns { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(360px, .8fr); gap: 14px; align-items: start; }
-    .file-section, .task-panel { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); padding: 16px; box-shadow: none; }
-    .task-panel { position: sticky; top: 16px; min-width: 0; max-height: calc(100vh - 32px); overflow-y: auto; }
+    .file-section, .task-panel { display: flex; flex-direction: column; height: 680px; min-width: 0; margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); padding: 16px; box-shadow: none; }
+    .task-panel { position: sticky; top: 16px; }
+    #task-panel-body { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+    .file-panel-body { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+    .file-list-scroll { flex: 1; min-height: 0; overflow-y: auto; }
     .section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .section-heading h2 { margin: 0; }
     .section-heading p { margin: 3px 0 0; font-size: 12px; }
     .file-tools { display: flex; align-items: center; gap: 7px; }
     .file-tool-button { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; background: var(--primary); color: #fff; }
     .file-tool-button:hover, .file-tool-button[aria-expanded="true"] { background: var(--primary-dark); color: #fff; }
-    .task-list { border-top: 1px solid var(--line); }
+    .task-list { flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--line); }
     .task-item { padding: 12px 0; border-bottom: 1px solid var(--line); }
     .task-primary { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
     .task-name { min-width: 0; overflow-wrap: anywhere; font-weight: 650; }
@@ -1229,6 +1232,11 @@ def page(title: str, body: str) -> bytes:
     .filter-btn { background: #e8eef3; color: #29465e; border-radius: 6px; padding: 6px 10px; }
     .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
     .file-table { table-layout: auto; }
+    .file-table th, .file-table td { border-bottom: 0; }
+    .file-table thead th { position: sticky; top: 0; z-index: 1; background: var(--card-bg); }
+    .file-table thead tr { border-bottom: 1px solid var(--line); }
+    .file-table tbody tr { border-bottom: 1px solid var(--line); }
+    .file-table tbody td { border-bottom: 0; }
     .file-table th:last-child { width: 190px; text-align: right; }
     .file-row-main { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
     .file-type-icon { width: 32px; flex: 0 0 32px; font-size: 28px; line-height: 1; text-align: center; color: #3b596f; }
@@ -1236,7 +1244,8 @@ def page(title: str, body: str) -> bytes:
     .file-name { overflow-wrap: anywhere; font-weight: 650; }
     .file-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; color: var(--muted); font-size: 12px; }
     .tag { background: #edf2f5; color: #415566; }
-    .file-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; min-width: 184px; }
+    .file-actions { min-width: 184px; text-align: right; }
+    .file-action-group { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
     .file-action { white-space: nowrap; }
     .file-menu { position: relative; }
     .file-menu-toggle { width: 40px; height: 40px; padding: 0; font-size: 20px; }
@@ -1246,6 +1255,10 @@ def page(title: str, body: str) -> bytes:
     .menu-command:hover { background: var(--file-bg); color: var(--text); }
     .danger-text { color: #b4232c; }
     .renew-btn:disabled { opacity: .65; cursor: wait; }
+    .pagination { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 42px; margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); }
+    .pagination button { width: 34px; height: 34px; padding: 0; font-size: 20px; line-height: 1; }
+    .pagination button:disabled { opacity: .45; cursor: default; transform: none; }
+    .pagination-label { min-width: 70px; color: var(--muted); text-align: center; font-size: 13px; font-variant-numeric: tabular-nums; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     .filter-empty { display: none; padding: 24px 16px; color: var(--muted); text-align: center; }
     .filter-empty.visible { display: block; }
@@ -1273,7 +1286,9 @@ def page(title: str, body: str) -> bytes:
       .app-shell { display: block; }
       .file-workspace { width: 100%; }
       .workspace-columns { grid-template-columns: minmax(0, 1fr); }
-      .task-panel { position: static; max-height: none; }
+      .file-section, .task-panel { height: auto; min-height: 0; }
+      .task-panel { position: static; }
+      .task-list { overflow-y: visible; }
       .file-menu-panel { position: fixed; top: auto; right: 12px; bottom: 12px; z-index: 950; max-height: calc(100vh - 36px); overflow-y: auto; }
       .admin-modal-overlay { padding: 16px 3vw; }
       .admin-modal, .admin-modal-upload { width: 94vw; max-height: 88vh; }
@@ -1283,6 +1298,7 @@ def page(title: str, body: str) -> bytes:
       .file-row:last-child { border-bottom: 0; }
       .file-row > td { display: block; border: 0; padding: 0; }
       .file-actions { min-width: 0; }
+      .file-action-group { justify-content: flex-end; }
     }
     @media (max-width: 520px) {
       .site-header { flex-wrap: wrap; }
@@ -1290,7 +1306,8 @@ def page(title: str, body: str) -> bytes:
       .status-strip { grid-template-columns: 1fr; }
       .status-item { min-height: 112px; }
       .file-row { grid-template-columns: 1fr; }
-      .file-actions { justify-content: flex-start; padding-left: 42px; }
+      .file-actions { padding-left: 42px; text-align: left; }
+      .file-action-group { justify-content: flex-start; }
     }
     """
     script = """
@@ -1353,6 +1370,8 @@ def page(title: str, body: str) -> bytes:
         if (!response.ok) throw new Error(payload.error || '\u5237\u65b0\u4efb\u52a1\u5931\u8d25');
         body.innerHTML = payload.html;
         summary.textContent = payload.summary;
+        _taskPage = 1;
+        applyTaskPagination();
         scheduleTaskRefresh(payload.poll ? 3000 : 30000);
       } catch (error) {
         scheduleTaskRefresh(15000);
@@ -1580,22 +1599,75 @@ def page(title: str, body: str) -> bytes:
     })();
     var _curFilter = 'all';
     var _curSearch = '';
+    var _filePage = 1;
+    var FILE_PAGE_SIZE = 6;
+    var TASK_PAGE_SIZE = 5;
+    var _taskPage = 1;
     function _applyFilters() {
       var rows = document.querySelectorAll('.file-row');
       var q = _curSearch.toLowerCase();
-      var visible = 0;
+      var matches = [];
       for (var i = 0; i < rows.length; i++) {
         var name = rows[i].getAttribute('data-name') || '';
         var matchType = _curFilter === 'all' || rows[i].getAttribute('data-type') === _curFilter;
         var matchSearch = !q || name.toLowerCase().indexOf(q) >= 0;
-        rows[i].style.display = matchType && matchSearch ? '' : 'none';
-        if (matchType && matchSearch) visible += 1;
+        if (matchType && matchSearch) matches.push(rows[i]);
+        else rows[i].style.display = 'none';
+      }
+      var totalPages = Math.max(1, Math.ceil(matches.length / FILE_PAGE_SIZE) || 1);
+      if (_filePage > totalPages) _filePage = totalPages;
+      if (_filePage < 1) _filePage = 1;
+      var start = (_filePage - 1) * FILE_PAGE_SIZE;
+      var end = start + FILE_PAGE_SIZE;
+      for (var j = 0; j < matches.length; j++) {
+        matches[j].style.display = (j >= start && j < end) ? '' : 'none';
       }
       var empty = document.getElementById('filter-empty');
-      if (empty) empty.classList.toggle('visible', rows.length > 0 && visible === 0);
+      if (empty) empty.classList.toggle('visible', rows.length > 0 && matches.length === 0);
+      var label = document.getElementById('file-page-label');
+      var prev = document.getElementById('file-page-prev');
+      var next = document.getElementById('file-page-next');
+      if (label) label.textContent = _filePage + ' / ' + totalPages;
+      if (prev) prev.disabled = _filePage <= 1 || matches.length === 0;
+      if (next) next.disabled = _filePage >= totalPages || matches.length === 0;
+    }
+    function changeFilePage(delta) {
+      _filePage += delta;
+      _applyFilters();
+    }
+    function applyTaskPagination() {
+      var items = document.querySelectorAll('.task-item');
+      if (!items.length) {
+        var emptyLabel = document.getElementById('task-page-label');
+        var emptyPrev = document.getElementById('task-page-prev');
+        var emptyNext = document.getElementById('task-page-next');
+        if (emptyLabel) emptyLabel.textContent = '0 / 0';
+        if (emptyPrev) emptyPrev.disabled = true;
+        if (emptyNext) emptyNext.disabled = true;
+        return;
+      }
+      var totalPages = Math.max(1, Math.ceil(items.length / TASK_PAGE_SIZE));
+      if (_taskPage > totalPages) _taskPage = totalPages;
+      if (_taskPage < 1) _taskPage = 1;
+      var start = (_taskPage - 1) * TASK_PAGE_SIZE;
+      var end = start + TASK_PAGE_SIZE;
+      for (var i = 0; i < items.length; i++) {
+        items[i].style.display = (i >= start && i < end) ? '' : 'none';
+      }
+      var label = document.getElementById('task-page-label');
+      var prev = document.getElementById('task-page-prev');
+      var next = document.getElementById('task-page-next');
+      if (label) label.textContent = _taskPage + ' / ' + totalPages;
+      if (prev) prev.disabled = _taskPage <= 1;
+      if (next) next.disabled = _taskPage >= totalPages;
+    }
+    function changeTaskPage(delta) {
+      _taskPage += delta;
+      applyTaskPagination();
     }
     function filterFiles(type, selectedButton) {
       _curFilter = type;
+      _filePage = 1;
       var btns = document.querySelectorAll('.filter-btn');
       for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
       if (selectedButton) selectedButton.classList.add('active');
@@ -1603,6 +1675,7 @@ def page(title: str, body: str) -> bytes:
     }
     function searchFiles(q) {
       _curSearch = q;
+      _filePage = 1;
       _applyFilters();
     }
     function closeFileMenus(exceptMenu) {
@@ -1761,6 +1834,8 @@ def page(title: str, body: str) -> bytes:
       closeActiveAdminModal();
       if (openButton) openButton.focus();
     });
+    _applyFilters();
+    applyTaskPagination();
     scheduleTaskRefresh(3000);
     """
     html_doc = f"""<!doctype html>
@@ -1810,7 +1885,15 @@ def file_type_icon(file_type_name: str) -> str:
 
 def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> str:
     if not files:
-        return '<div class="empty">暂无可下载文件</div>'
+        return (
+            '<div class="file-panel-body">'
+            '<div class="file-list-scroll"><div class="empty">暂无可下载文件</div></div>'
+            '<div class="pagination" aria-label="文件分页">'
+            '<button id="file-page-prev" class="secondary" type="button" onclick="changeFilePage(-1)" aria-label="上一页" title="上一页" disabled>‹</button>'
+            '<span id="file-page-label" class="pagination-label">0 / 0</span>'
+            '<button id="file-page-next" class="secondary" type="button" onclick="changeFilePage(1)" aria-label="下一页" title="下一页" disabled>›</button>'
+            '</div></div>'
+        )
     filter_bar = (
         '<input class="search-box" type="text" placeholder="\u641c\u7d22\u6587\u4ef6\u540d..." oninput="searchFiles(this.value)">'
         '<div class="filter-bar">'
@@ -1871,24 +1954,39 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<span>下载 {max(0, int(item.get("download_count", 0)))} 次</span>'
             f'<span class="tag">{ret_label}</span>'
             '</div></div></div></td>'
-            f'<td class="file-actions">{actions}</td>'
+            f'<td class="file-actions"><div class="file-action-group">{actions}</div></td>'
             "</tr>"
         )
     return (
         filter_bar +
+        '<div class="file-panel-body">'
+        '<div class="file-list-scroll">'
         '<table class="file-table"><thead><tr><th>文件</th><th>操作</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table>'
         '<div id="filter-empty" class="filter-empty">没有匹配的文件</div>'
+        '</div>'
+        '<div class="pagination" aria-label="文件分页">'
+        '<button id="file-page-prev" class="secondary" type="button" onclick="changeFilePage(-1)" aria-label="上一页" title="上一页">‹</button>'
+        '<span id="file-page-label" class="pagination-label">1 / 1</span>'
+        '<button id="file-page-next" class="secondary" type="button" onclick="changeFilePage(1)" aria-label="下一页" title="下一页">›</button>'
+        '</div></div>'
     )
 
 
 def render_task_rows(task_data: dict[str, object]) -> str:
+    pagination = (
+        '<div class="pagination" aria-label="任务分页">'
+        '<button id="task-page-prev" class="secondary" type="button" onclick="changeTaskPage(-1)" aria-label="上一页" title="上一页">‹</button>'
+        '<span id="task-page-label" class="pagination-label">1 / 1</span>'
+        '<button id="task-page-next" class="secondary" type="button" onclick="changeTaskPage(1)" aria-label="下一页" title="下一页">›</button>'
+        '</div>'
+    )
     if not task_data.get("ok"):
         error = html.escape(str(task_data.get("error") or "aria2 RPC 暂不可用"))
-        return f'<p class="muted">无法读取 aria2 任务：{error}</p>'
+        return f'<p class="muted">无法读取 aria2 任务：{error}</p>{pagination}'
     tasks = task_data.get("tasks") or []
     if not isinstance(tasks, list) or not tasks:
-        return '<div class="empty">暂无下载任务</div>'
+        return f'<div class="empty">暂无下载任务</div>{pagination}'
     rows = []
     for task in tasks:
         if not isinstance(task, dict):
@@ -1937,7 +2035,7 @@ def render_task_rows(task_data: dict[str, object]) -> str:
         '<button class="secondary" type="submit">清理已完成任务记录</button>'
         "</form>"
     )
-    return f'<div class="task-list">{"".join(rows)}</div>{clear_form}'
+    return f'<div class="task-list">{"".join(rows)}</div>{pagination}{clear_form}'
 
 
 def task_panel_payload(task_data: dict[str, object] | None = None) -> dict[str, object]:
