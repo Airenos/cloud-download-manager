@@ -1187,8 +1187,8 @@ def page(title: str, body: str) -> bytes:
     .file-workspace { min-width: 0; padding: 0; }
     .admin-tool-icon { font-size: 25px; line-height: 1; }
     body.admin-modal-open { overflow: hidden; }
-    .admin-modal-overlay { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 23, 42, .58); }
-    .admin-modal-overlay[hidden] { display: none; }
+    .admin-modal-overlay, .danger-confirm-overlay { position: fixed; inset: 0; z-index: 1100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 23, 42, .58); }
+    .admin-modal-overlay[hidden], .danger-confirm-overlay[hidden] { display: none; }
     .admin-modal { display: flex; flex-direction: column; width: min(100%, 520px); max-height: 88vh; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); color: var(--text); box-shadow: 0 20px 60px rgba(15, 23, 42, .28); }
     .admin-modal-upload { width: min(100%, 560px); }
     .admin-modal-header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
@@ -1198,6 +1198,11 @@ def page(title: str, body: str) -> bytes:
     .admin-modal-close { flex: 0 0 40px; width: 40px; height: 40px; padding: 0; display: grid; place-items: center; background: transparent; color: var(--text); font-size: 24px; line-height: 1; }
     .admin-modal-close:hover { background: var(--line); color: var(--text); }
     .admin-modal input[type=submit] { width: 100%; }
+    .danger-confirm-modal { width: min(100%, 440px); }
+    .danger-confirm-message { margin: 0 0 14px; color: var(--text); }
+    .danger-confirm-error { margin: 10px 0 0; color: #b4232c; font-weight: 650; }
+    .danger-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    .danger-confirm-actions button { min-width: 88px; }
     .field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 8px; align-items: start; }
     .field-with-action textarea { height: 150px; min-height: 150px; resize: none; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--input-border) transparent; }
     .field-with-action textarea::-webkit-scrollbar { width: 8px; }
@@ -1306,7 +1311,7 @@ def page(title: str, body: str) -> bytes:
       .task-panel { position: static; }
       .task-list { overflow-y: visible; }
       .file-menu-panel { position: fixed; top: auto; right: 12px; bottom: 12px; z-index: 950; max-height: calc(100vh - 36px); overflow-y: auto; }
-      .admin-modal-overlay { padding: 16px 3vw; }
+      .admin-modal-overlay, .danger-confirm-overlay { padding: 16px 3vw; }
       .admin-modal, .admin-modal-upload { width: 94vw; max-height: 88vh; }
       .status-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .file-table thead { display: none; }
@@ -1845,30 +1850,116 @@ def page(title: str, body: str) -> bytes:
         button.disabled = false;
       }
     }
-    async function deleteFile(button) {
+    var dangerConfirmState = null;
+    var dangerConfirmTrigger = null;
+    function openDangerConfirm(options, trigger) {
+      var modal = document.getElementById('danger-confirm-modal');
+      var title = document.getElementById('danger-confirm-title');
+      var message = document.getElementById('danger-confirm-message');
+      var passwordField = document.getElementById('danger-password-field');
+      var password = document.getElementById('danger-password');
+      var error = document.getElementById('danger-confirm-error');
+      var submit = document.getElementById('danger-confirm-submit');
+      if (!modal || !title || !message || !passwordField || !password || !error || !submit) return;
+      dangerConfirmState = options;
+      dangerConfirmTrigger = trigger || null;
+      title.textContent = options.title;
+      message.textContent = options.message;
+      passwordField.hidden = !options.requiresPassword;
+      password.required = !!options.requiresPassword;
+      password.value = '';
+      error.hidden = true;
+      error.textContent = '';
+      submit.textContent = options.confirmLabel || '\u786e\u8ba4';
+      submit.disabled = false;
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+      document.body.classList.add('admin-modal-open');
+      (options.requiresPassword ? password : submit).focus();
+    }
+    function closeDangerConfirm() {
+      var modal = document.getElementById('danger-confirm-modal');
+      if (!modal || modal.dataset.busy === 'true') return false;
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+      dangerConfirmState = null;
+      document.body.classList.remove('admin-modal-open');
+      if (dangerConfirmTrigger) dangerConfirmTrigger.focus();
+      dangerConfirmTrigger = null;
+      return true;
+    }
+    function updateDiskStats(stats) {
+      if (!stats) return;
+      var used = document.getElementById('downloads-used-value');
+      var free = document.getElementById('free-space-value');
+      var bar = document.getElementById('disk-usage-bar');
+      if (used) used.textContent = stats.downloads_used_human;
+      if (free) free.textContent = stats.free_human;
+      if (bar) {
+        bar.style.width = stats.disk_percent + '%';
+        bar.classList.toggle('danger', !!stats.disk_danger);
+        bar.classList.toggle('warn', !stats.disk_danger && stats.disk_percent > 80);
+      }
+    }
+    function deleteFile(button) {
       if (!button || button.disabled) return;
-      var filename = button.dataset.filename || '';
-      if (!window.confirm('\u786e\u5b9a\u5220\u9664\u6587\u4ef6\u201c' + filename + '\u201d\u5417\uff1f\u6b64\u64cd\u4f5c\u65e0\u6cd5\u64a4\u9500\u3002')) return;
-      var password = window.prompt('\u8bf7\u8f93\u5165\u7ba1\u7406\u5bc6\u7801');
-      if (password === null) return;
-      button.disabled = true;
+      closeFileMenus();
+      openDangerConfirm({
+        mode: 'delete',
+        title: '\u5220\u9664\u6587\u4ef6',
+        message: '\u786e\u5b9a\u5220\u9664\u201c' + (button.dataset.filename || '') + '\u201d\u5417\uff1f\u6b64\u64cd\u4f5c\u65e0\u6cd5\u64a4\u9500\u3002',
+        confirmLabel: '\u5220\u9664',
+        requiresPassword: true,
+        filename: button.dataset.filename || '',
+        button: button
+      }, button);
+    }
+    function confirmOnceDownload(link) {
+      closeFileMenus();
+      openDangerConfirm({
+        mode: 'once',
+        title: '\u4e00\u6b21\u6027\u4e0b\u8f7d',
+        message: '\u4e0b\u8f7d\u5b8c\u6210\u540e\u6587\u4ef6\u5c06\u7acb\u5373\u5220\u9664\uff0c\u65e0\u6cd5\u6062\u590d\u3002',
+        confirmLabel: '\u7ee7\u7eed\u4e0b\u8f7d',
+        requiresPassword: false,
+        url: link.href
+      }, link);
+      return false;
+    }
+    async function submitDangerConfirm() {
+      if (!dangerConfirmState) return;
+      var state = dangerConfirmState;
+      var modal = document.getElementById('danger-confirm-modal');
+      var submit = document.getElementById('danger-confirm-submit');
+      var password = document.getElementById('danger-password');
+      var error = document.getElementById('danger-confirm-error');
+      if (state.mode === 'once') {
+        var url = state.url;
+        closeDangerConfirm();
+        window.location.href = url;
+        return;
+      }
+      if (!modal || !submit || !password || !error) return;
+      modal.dataset.busy = 'true';
+      submit.disabled = true;
       try {
-        var payload = await postFormJson('/api/delete-file', {filename: filename, password: password});
-        var row = button.closest('.file-row');
-        closeFileMenus();
+        var payload = await postFormJson('/api/delete-file', {filename: state.filename, password: password.value});
+        var row = state.button && state.button.closest('.file-row');
+        modal.dataset.busy = 'false';
+        closeDangerConfirm();
         if (row) row.remove();
         var fileCount = document.getElementById('file-count-value');
         if (fileCount) fileCount.textContent = String(document.querySelectorAll('.file-row').length);
+        updateDiskStats(payload.stats);
         _applyFilters();
         showToast(payload.message || '\u6587\u4ef6\u5df2\u5220\u9664');
-      } catch (error) {
-        showToast(error.message || '\u5220\u9664\u5931\u8d25');
-        button.disabled = false;
+      } catch (requestError) {
+        modal.dataset.busy = 'false';
+        submit.disabled = false;
+        error.textContent = requestError.message || '\u5220\u9664\u5931\u8d25';
+        error.hidden = false;
+        password.focus();
       }
-    }
-    function confirmOnceDownload() {
-      closeFileMenus();
-      return window.confirm('\u4e00\u6b21\u6027\u4e0b\u8f7d\u5b8c\u6210\u540e\u6587\u4ef6\u5c06\u7acb\u5373\u5220\u9664\uff0c\u65e0\u6cd5\u6062\u590d\u3002\u786e\u5b9a\u7ee7\u7eed\u5417\uff1f');
     }
     document.addEventListener('click', function(e) {
       var adminTrigger = e.target.closest && e.target.closest('[data-admin-modal]');
@@ -1879,6 +1970,16 @@ def page(title: str, body: str) -> bytes:
       var adminClose = e.target.closest && e.target.closest('[data-close-admin-modal]');
       if (adminClose) {
         closeActiveAdminModal();
+        return;
+      }
+      var dangerClose = e.target.closest && e.target.closest('[data-close-danger-confirm]');
+      if (dangerClose) {
+        closeDangerConfirm();
+        return;
+      }
+      var dangerOverlay = e.target.closest && e.target.closest('.danger-confirm-overlay');
+      if (dangerOverlay && e.target === dangerOverlay) {
+        closeDangerConfirm();
         return;
       }
       var adminOverlay = e.target.closest && e.target.closest('.admin-modal-overlay');
@@ -1905,6 +2006,7 @@ def page(title: str, body: str) -> bytes:
       closeFileMenus();
       closeShare();
       closeActiveAdminModal();
+      closeDangerConfirm();
       if (openButton) openButton.focus();
     });
     _applyFilters();
@@ -1922,6 +2024,26 @@ def page(title: str, body: str) -> bytes:
 </head>
 <body>
   <main>{body}</main>
+  <div id="danger-confirm-modal" class="danger-confirm-overlay" hidden aria-hidden="true">
+    <section class="admin-modal danger-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="danger-confirm-title" aria-describedby="danger-confirm-message">
+      <header class="admin-modal-header">
+        <h2 id="danger-confirm-title">确认操作</h2>
+        <button class="admin-modal-close" type="button" data-close-danger-confirm aria-label="关闭确认弹窗">×</button>
+      </header>
+      <form class="admin-modal-body" onsubmit="submitDangerConfirm(); return false">
+        <p id="danger-confirm-message" class="danger-confirm-message"></p>
+        <div id="danger-password-field" hidden>
+          <label for="danger-password">管理密码</label>
+          <input id="danger-password" name="password" type="password" autocomplete="current-password">
+        </div>
+        <p id="danger-confirm-error" class="danger-confirm-error" hidden></p>
+        <div class="danger-confirm-actions">
+          <button class="secondary" type="button" data-close-danger-confirm>取消</button>
+          <button id="danger-confirm-submit" class="danger" type="submit">确认</button>
+        </div>
+      </form>
+    </section>
+  </div>
   <script>{script}</script>
   <script>{QR_JS}</script>
 </body>
@@ -2013,7 +2135,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<div id="{menu_id}" class="file-menu-panel" hidden>'
             f'<button class="share-btn menu-command" type="button" '
             f'data-url="/file/{url_name}" data-name="{safe_name_attr}">二维码分享</button>'
-            f'<a class="menu-command danger-text" href="/once/{url_name}" onclick="return confirmOnceDownload()">一次性下载</a>'
+            f'<a class="menu-command danger-text" href="/once/{url_name}" onclick="return confirmOnceDownload(this)">一次性下载</a>'
             f'{renew_button}'
             '<button class="menu-command danger-text delete-file-btn" type="button" '
             f'data-filename="{safe_name_attr}" onclick="deleteFile(this)">删除文件</button>'
@@ -2165,9 +2287,9 @@ def render_home(message: str = "") -> bytes:
 <div class="app-shell">
   <div class="file-workspace">
     <div class="status-strip">
-      <div class="status-item"><span>下载目录占用</span><strong>{html.escape(str(stats["downloads_used_human"]))}</strong></div>
-      <div class="status-item"><span>剩余磁盘空间</span><strong>{html.escape(str(stats["free_human"]))}</strong>
-        <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
+      <div class="status-item"><span>下载目录占用</span><strong id="downloads-used-value">{html.escape(str(stats["downloads_used_human"]))}</strong></div>
+      <div class="status-item"><span>剩余磁盘空间</span><strong id="free-space-value">{html.escape(str(stats["free_human"]))}</strong>
+        <div class="disk-bar-outer"><div id="disk-usage-bar" class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
       </div>
       <div class="status-item"><span>文件数量</span><strong id="file-count-value">{len(files)}</strong></div>
     </div>
@@ -2300,7 +2422,7 @@ def render_view(path: Path, preview_count: int = 0) -> bytes:
   <div class="actions">
     <a class="button secondary" href="/">返回文件列表</a>
     <a class="button secondary" href="{download_url}">普通下载</a>
-    <a class="button" href="{once_url}" onclick="return confirmOnceDownload()">一次性下载</a>
+    <a class="button" href="{once_url}" onclick="return confirmOnceDownload(this)">一次性下载</a>
     <button class="theme-toggle" type="button" onclick="toggleTheme()" title="切换主题">🌓</button>
   </div>
 </header>
@@ -2568,7 +2690,17 @@ class DownloadHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             self.send_json(500, {"error": f"删除文件失败：{exc}"})
             return
-        self.send_json(200, {"ok": True, "message": "文件已删除"})
+        stats = get_disk_stats()
+        self.send_json(200, {
+            "ok": True,
+            "message": "文件已删除",
+            "stats": {
+                "downloads_used_human": stats["downloads_used_human"],
+                "free_human": stats["free_human"],
+                "disk_percent": stats["disk_percent"],
+                "disk_danger": stats["disk_danger"],
+            },
+        })
 
     def handle_upload_init(self, form: dict[str, str]) -> None:
         if not check_admin_password(form.get("password", "")):

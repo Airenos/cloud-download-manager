@@ -519,7 +519,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('class="file-menu-toggle', body)
         self.assertIn('data-url="/file/clip.mp4"', body)
         self.assertIn('href="/once/clip.mp4"', body)
-        self.assertIn('onclick="return confirmOnceDownload()"', body)
+        self.assertIn('onclick="return confirmOnceDownload(this)"', body)
         self.assertIn('id="file-sort"', body)
         self.assertIn('value="created-desc"', body)
         self.assertIn('value="expires-asc"', body)
@@ -773,6 +773,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertTrue(payload["ok"])
+            self.assertIn("downloads_used_human", payload["stats"])
+            self.assertIn("free_human", payload["stats"])
+            self.assertIn("disk_percent", payload["stats"])
+            self.assertEqual(payload["stats"]["downloads_used_human"], "0 B")
             self.assertFalse(target.exists())
             self.assertNotIn(target.name, self.ds.load_meta())
         finally:
@@ -829,6 +833,13 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "function deleteFile",
             "'/api/delete-file'",
             "function confirmOnceDownload",
+            "function openDangerConfirm",
+            "function closeDangerConfirm",
+            "function submitDangerConfirm",
+            "function updateDiskStats",
+            "id=\"danger-confirm-modal\"",
+            "id=\"downloads-used-value\"",
+            "id=\"disk-usage-bar\"",
             "function sortFiles",
             "if (resetPage) _taskPage = 1",
             "body.contains(document.activeElement)",
@@ -843,6 +854,9 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "scheduleTaskRefresh",
         ):
             self.assertIn(script_marker, body)
+
+        self.assertNotIn("window.confirm", body)
+        self.assertNotIn("window.prompt", body)
 
     def test_mobile_workspace_stacks_tasks_after_files_without_fixed_toolbar(self):
         body = self.ds.render_home().decode("utf-8")
@@ -1060,7 +1074,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertIn("点击 3 次", body)
             self.assertIn('href="/">返回文件列表</a>', body)
             self.assertNotIn('href="/downloads/"', body)
-            self.assertIn('onclick="return confirmOnceDownload()"', body)
+            self.assertIn('onclick="return confirmOnceDownload(this)"', body)
+            self.assertIn('id="danger-confirm-modal"', body)
             self.assertEqual(self.ds.load_meta()["picture.png"]["preview_count"], 3.0)
         finally:
             server.shutdown()
