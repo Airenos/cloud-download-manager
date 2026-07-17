@@ -1244,6 +1244,7 @@ def page(title: str, body: str) -> bytes:
     .filter-bar { gap: 5px; margin-bottom: 8px; }
     .filter-btn { background: #e8eef3; color: #29465e; border-radius: 6px; padding: 6px 10px; }
     .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
+    .file-sort { width: auto; min-width: 190px; margin-left: auto; padding: 6px 30px 6px 10px; font-size: 13px; }
     .file-table { table-layout: auto; }
     .file-table th, .file-table td { border-bottom: 0; }
     .file-table thead th { position: sticky; top: 0; z-index: 1; background: var(--card-bg); }
@@ -1323,6 +1324,7 @@ def page(title: str, body: str) -> bytes:
       .file-row { grid-template-columns: 1fr; }
       .file-actions { padding-left: 42px; text-align: left; }
       .file-action-group { justify-content: flex-start; }
+      .file-sort { width: 100%; margin-left: 0; }
     }
     """
     script = """
@@ -1373,11 +1375,15 @@ def page(title: str, body: str) -> bytes:
       clearTimeout(taskRefreshTimer);
       taskRefreshTimer = setTimeout(function() { refreshTaskPanel(); }, delay);
     }
-    async function refreshTaskPanel() {
+    async function refreshTaskPanel(resetPage) {
       if (taskRefreshBusy) return;
       var body = document.getElementById('task-panel-body');
       var summary = document.getElementById('task-summary');
       if (!body || !summary) return;
+      if (!resetPage && body.contains(document.activeElement)) {
+        scheduleTaskRefresh(3000);
+        return;
+      }
       taskRefreshBusy = true;
       try {
         var response = await fetch('/api/task-panel', {cache: 'no-store'});
@@ -1385,7 +1391,7 @@ def page(title: str, body: str) -> bytes:
         if (!response.ok) throw new Error(payload.error || '\u5237\u65b0\u4efb\u52a1\u5931\u8d25');
         body.innerHTML = payload.html;
         summary.textContent = payload.summary;
-        _taskPage = 1;
+        if (resetPage) _taskPage = 1;
         applyTaskPagination();
         scheduleTaskRefresh(payload.poll ? 3000 : 30000);
       } catch (error) {
@@ -1439,7 +1445,7 @@ def page(title: str, body: str) -> bytes:
           filename: urls.length === 1 ? form.querySelector('[name=filename]').value : '',
           retention: form.querySelector('[name=retention]').value
         });
-        await refreshTaskPanel();
+        await refreshTaskPanel(true);
         closeActiveAdminModal();
         form.reset();
         updateTaskFilenameAvailability();
@@ -1614,6 +1620,7 @@ def page(title: str, body: str) -> bytes:
     })();
     var _curFilter = 'all';
     var _curSearch = '';
+    var _fileSort = 'name';
     var _filePage = 1;
     var FILE_PAGE_SIZE = 6;
     var TASK_PAGE_SIZE = 5;
@@ -1622,12 +1629,24 @@ def page(title: str, body: str) -> bytes:
       var rows = document.querySelectorAll('.file-row');
       var q = _curSearch.toLowerCase();
       var matches = [];
-      for (var i = 0; i < rows.length; i++) {
-        var name = rows[i].getAttribute('data-name') || '';
-        var matchType = _curFilter === 'all' || rows[i].getAttribute('data-type') === _curFilter;
+      var orderedRows = Array.prototype.slice.call(rows);
+      orderedRows.sort(function(a, b) {
+        if (_fileSort === 'created-desc') return Number(b.dataset.created) - Number(a.dataset.created);
+        if (_fileSort === 'created-asc') return Number(a.dataset.created) - Number(b.dataset.created);
+        if (_fileSort === 'expires-asc') return Number(a.dataset.expires) - Number(b.dataset.expires);
+        if (_fileSort === 'expires-desc') return Number(b.dataset.expires) - Number(a.dataset.expires);
+        return Number(a.dataset.index) - Number(b.dataset.index);
+      });
+      var tbody = document.querySelector('.file-table tbody');
+      if (tbody) {
+        for (var orderIndex = 0; orderIndex < orderedRows.length; orderIndex++) tbody.appendChild(orderedRows[orderIndex]);
+      }
+      for (var i = 0; i < orderedRows.length; i++) {
+        var name = orderedRows[i].getAttribute('data-name') || '';
+        var matchType = _curFilter === 'all' || orderedRows[i].getAttribute('data-type') === _curFilter;
         var matchSearch = !q || name.toLowerCase().indexOf(q) >= 0;
-        if (matchType && matchSearch) matches.push(rows[i]);
-        else rows[i].style.display = 'none';
+        if (matchType && matchSearch) matches.push(orderedRows[i]);
+        else orderedRows[i].style.display = 'none';
       }
       if (!rows.length) {
         var noRowsLabel = document.getElementById('file-page-label');
@@ -1699,6 +1718,11 @@ def page(title: str, body: str) -> bytes:
     }
     function searchFiles(q) {
       _curSearch = q;
+      _filePage = 1;
+      _applyFilters();
+    }
+    function sortFiles(value) {
+      _fileSort = value || 'name';
       _filePage = 1;
       _applyFilters();
     }
@@ -1833,12 +1857,18 @@ def page(title: str, body: str) -> bytes:
         var row = button.closest('.file-row');
         closeFileMenus();
         if (row) row.remove();
+        var fileCount = document.getElementById('file-count-value');
+        if (fileCount) fileCount.textContent = String(document.querySelectorAll('.file-row').length);
         _applyFilters();
         showToast(payload.message || '\u6587\u4ef6\u5df2\u5220\u9664');
       } catch (error) {
         showToast(error.message || '\u5220\u9664\u5931\u8d25');
         button.disabled = false;
       }
+    }
+    function confirmOnceDownload() {
+      closeFileMenus();
+      return window.confirm('\u4e00\u6b21\u6027\u4e0b\u8f7d\u5b8c\u6210\u540e\u6587\u4ef6\u5c06\u7acb\u5373\u5220\u9664\uff0c\u65e0\u6cd5\u6062\u590d\u3002\u786e\u5b9a\u7ee7\u7eed\u5417\uff1f');
     }
     document.addEventListener('click', function(e) {
       var adminTrigger = e.target.closest && e.target.closest('[data-admin-modal]');
@@ -1947,6 +1977,14 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         '<button class="filter-btn" type="button" onclick="filterFiles(\'document\', this)">\u6587\u6863</button>'
         '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\', this)">\u538b\u7f29\u5305</button>'
         '<button class="filter-btn" type="button" onclick="filterFiles(\'other\', this)">\u5176\u4ed6</button>'
+        '<label class="sr-only" for="file-sort">文件排序</label>'
+        '<select id="file-sort" class="file-sort" onchange="sortFiles(this.value)">'
+        '<option value="name">名称排序</option>'
+        '<option value="created-desc">创建时间：最新优先</option>'
+        '<option value="created-asc">创建时间：最早优先</option>'
+        '<option value="expires-asc">过期时间：最先优先</option>'
+        '<option value="expires-desc">过期时间：最晚优先</option>'
+        '</select>'
         '</div>'
     )
     rows = []
@@ -1975,7 +2013,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<div id="{menu_id}" class="file-menu-panel" hidden>'
             f'<button class="share-btn menu-command" type="button" '
             f'data-url="/file/{url_name}" data-name="{safe_name_attr}">二维码分享</button>'
-            f'<a class="menu-command danger-text" href="/once/{url_name}">一次性下载</a>'
+            f'<a class="menu-command danger-text" href="/once/{url_name}" onclick="return confirmOnceDownload()">一次性下载</a>'
             f'{renew_button}'
             '<button class="menu-command danger-text delete-file-btn" type="button" '
             f'data-filename="{safe_name_attr}" onclick="deleteFile(this)">删除文件</button>'
@@ -1988,7 +2026,8 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         )
         rows.append(
             f'<tr class="file-row" data-type="{html.escape(ft, quote=True)}" '
-            f'data-name="{safe_name_attr}">'
+            f'data-name="{safe_name_attr}" data-index="{index}" '
+            f'data-created="{float(item.get("created_at", 0)):.6f}" data-expires="{float(item.get("expires_at", 0)):.6f}">'
             '<td><div class="file-row-main">'
             f'<span class="file-type-icon" aria-hidden="true">{file_type_icon(ft)}</span>'
             '<div class="file-details">'
@@ -2130,7 +2169,7 @@ def render_home(message: str = "") -> bytes:
       <div class="status-item"><span>剩余磁盘空间</span><strong>{html.escape(str(stats["free_human"]))}</strong>
         <div class="disk-bar-outer"><div class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
       </div>
-      <div class="status-item"><span>文件数量</span><strong>{len(files)}</strong></div>
+      <div class="status-item"><span>文件数量</span><strong id="file-count-value">{len(files)}</strong></div>
     </div>
     <div class="workspace-columns">
       <section class="file-section">
@@ -2261,7 +2300,7 @@ def render_view(path: Path, preview_count: int = 0) -> bytes:
   <div class="actions">
     <a class="button secondary" href="/">返回文件列表</a>
     <a class="button secondary" href="{download_url}">普通下载</a>
-    <a class="button" href="{once_url}">一次性下载</a>
+    <a class="button" href="{once_url}" onclick="return confirmOnceDownload()">一次性下载</a>
     <button class="theme-toggle" type="button" onclick="toggleTheme()" title="切换主题">🌓</button>
   </div>
 </header>

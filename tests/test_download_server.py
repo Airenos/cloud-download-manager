@@ -519,6 +519,12 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('class="file-menu-toggle', body)
         self.assertIn('data-url="/file/clip.mp4"', body)
         self.assertIn('href="/once/clip.mp4"', body)
+        self.assertIn('onclick="return confirmOnceDownload()"', body)
+        self.assertIn('id="file-sort"', body)
+        self.assertIn('value="created-desc"', body)
+        self.assertIn('value="expires-asc"', body)
+        self.assertIn('data-created=', body)
+        self.assertIn('data-expires=', body)
         self.assertIn('class="menu-command renew-btn"', body)
         self.assertIn('class="menu-command danger-text delete-file-btn"', body)
         self.assertIn('onclick="deleteFile(this)"', body)
@@ -822,6 +828,11 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "function renewFile",
             "function deleteFile",
             "'/api/delete-file'",
+            "function confirmOnceDownload",
+            "function sortFiles",
+            "if (resetPage) _taskPage = 1",
+            "body.contains(document.activeElement)",
+            "await refreshTaskPanel(true)",
             "d.setAttribute('role', 'status')",
             "'，剩余 ' + payload.remaining",
             "function changeFilePage",
@@ -830,7 +841,6 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "noRowsLabel.textContent = '0 / 0'",
             "function refreshTaskPanel",
             "scheduleTaskRefresh",
-            "await refreshTaskPanel()",
         ):
             self.assertIn(script_marker, body)
 
@@ -1050,6 +1060,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertIn("点击 3 次", body)
             self.assertIn('href="/">返回文件列表</a>', body)
             self.assertNotIn('href="/downloads/"', body)
+            self.assertIn('onclick="return confirmOnceDownload()"', body)
             self.assertEqual(self.ds.load_meta()["picture.png"]["preview_count"], 3.0)
         finally:
             server.shutdown()
