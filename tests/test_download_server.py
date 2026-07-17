@@ -95,8 +95,15 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             return response.status, json.loads(response.read().decode("utf-8"))
 
     def test_custom_filename_validation_accepts_allowed_characters(self):
-        name = "中文 File_01-测试.txt"
-        self.assertEqual(self.ds.validate_custom_filename(name), name)
+        for name in ("中文 File_01-测试.txt", "视频 (1080p).mp4", "图片（原图）.png"):
+            with self.subTest(name=name):
+                self.assertEqual(self.ds.validate_custom_filename(name), name)
+
+    def test_format_time_uses_local_time_without_timezone_suffix(self):
+        formatted = self.ds.format_time(1_700_000_000)
+
+        self.assertRegex(formatted, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertNotIn("UTC+8", formatted)
 
     def test_upload_session_round_trip_and_paths_are_server_derived(self):
         session = self.ds.create_upload_session("video.bin", 9, 4, 0)
@@ -770,6 +777,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "navigator.clipboard.readText()",
             "document.getElementById('upload-retention').value",
             "function renewFile",
+            "d.setAttribute('role', 'status')",
+            "'，剩余 ' + payload.remaining",
             "function refreshTaskPanel",
             "scheduleTaskRefresh",
             "await refreshTaskPanel()",
@@ -847,6 +856,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
                 "created_at": self.ds.now_ts(),
                 "retention_seconds": 86400.0,
                 "download_count": 3.0,
+                "preview_count": 2.0,
             }
         })
 
@@ -854,6 +864,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         body = self.ds.render_file_rows(files, compact=True)
 
         self.assertEqual(files[0]["download_count"], 3)
+        self.assertEqual(files[0]["preview_count"], 2)
         self.assertIn("下载 3 次", body)
 
     def test_full_file_download_increments_count_but_head_does_not(self):
@@ -976,7 +987,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
     def test_view_route_renders_image_preview(self):
         target = self.ds.DOWNLOADS_DIR / "picture.png"
         target.write_bytes(b"\x89PNG\r\n\x1a\n")
-        self.ds.save_meta({"picture.png": {"created_at": 1_700_000_000.0}})
+        self.ds.save_meta({"picture.png": {"created_at": 1_700_000_000.0, "preview_count": 2.0}})
         server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -987,8 +998,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertIn("<img", body)
             self.assertIn("/media/picture.png", body)
             self.assertNotIn("<video", body)
+            self.assertIn("点击 3 次", body)
             self.assertIn('href="/">返回文件列表</a>', body)
             self.assertNotIn('href="/downloads/"', body)
+            self.assertEqual(self.ds.load_meta()["picture.png"]["preview_count"], 3.0)
         finally:
             server.shutdown()
             server.server_close()
@@ -997,7 +1010,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
     def test_view_route_renders_video_preview(self):
         target = self.ds.DOWNLOADS_DIR / "clip.mp4"
         target.write_bytes(b"0123456789")
-        self.ds.save_meta({"clip.mp4": {"created_at": 1_700_000_000.0}})
+        self.ds.save_meta({"clip.mp4": {"created_at": 1_700_000_000.0, "preview_count": 4.0}})
         server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1008,6 +1021,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertIn("<video", body)
             self.assertIn("controls", body)
             self.assertIn("/media/clip.mp4", body)
+            self.assertIn("播放/点击 5 次", body)
+            self.assertEqual(self.ds.load_meta()["clip.mp4"]["preview_count"], 5.0)
         finally:
             server.shutdown()
             server.server_close()
@@ -1043,6 +1058,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             body = resp.read().decode()
             self.assertIn("hello world", body)
             self.assertIn("code-block", body)
+            self.assertNotIn("preview_count", self.ds.load_meta()["notes.txt"])
         finally:
             server.shutdown()
             server.server_close()
@@ -1051,7 +1067,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
     def test_media_route_supports_range_for_video_playback(self):
         target = self.ds.DOWNLOADS_DIR / "range.mp4"
         target.write_bytes(b"0123456789")
-        self.ds.save_meta({"range.mp4": {"created_at": 1_700_000_000.0}})
+        self.ds.save_meta({"range.mp4": {"created_at": 1_700_000_000.0, "preview_count": 7.0}})
         server = self.ds.ThreadingHTTPServer(("127.0.0.1", 0), self.ds.DownloadHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1065,6 +1081,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertEqual(status, 206)
             self.assertEqual(body, b"2345")
             self.assertEqual(content_range, "bytes 2-5/10")
+            self.assertEqual(self.ds.load_meta()["range.mp4"]["preview_count"], 7.0)
         finally:
             server.shutdown()
             server.server_close()

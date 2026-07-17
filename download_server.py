@@ -144,7 +144,7 @@ def format_time(ts: int | float | None) -> str:
     if not ts:
         return "-"
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(TIMEZONE_CN).strftime(
-        "%Y-%m-%d %H:%M:%S UTC+8"
+        "%Y-%m-%d %H:%M:%S"
     )
 
 
@@ -247,6 +247,8 @@ def load_meta() -> dict[str, dict[str, float]]:
                     entry["retention_seconds"] = float(item["retention_seconds"])
                 if "download_count" in item:
                     entry["download_count"] = float(max(0, int(item["download_count"])))
+                if "preview_count" in item:
+                    entry["preview_count"] = float(max(0, int(item["preview_count"])))
                 result[name] = entry
             except (KeyError, TypeError, ValueError):
                 continue
@@ -275,6 +277,22 @@ def increment_download_count(filename: str) -> int:
         entry["download_count"] = float(count)
         save_meta(meta)
     append_log("download.log", f"completed name={filename} count={count}")
+    return count
+
+
+def increment_preview_count(filename: str) -> int:
+    with META_LOCK:
+        meta = load_meta()
+        entry = meta.get(filename)
+        if entry is None:
+            path = DOWNLOADS_DIR / filename
+            if not path.exists():
+                return 0
+            entry = {"created_at": now_ts()}
+            meta[filename] = entry
+        count = max(0, int(entry.get("preview_count", 0))) + 1
+        entry["preview_count"] = float(count)
+        save_meta(meta)
     return count
 
 
@@ -528,6 +546,7 @@ def scan_files() -> list[dict[str, object]]:
                 "remaining_text": format_remaining(expires_at),
                 "retention_label": format_retention(ret_secs),
                 "download_count": max(0, int(entry.get("download_count", 0))),
+                "preview_count": max(0, int(entry.get("preview_count", 0))),
                 "file_type": file_type(name),
                 "url_name": urllib.parse.quote(name),
             }
@@ -608,13 +627,13 @@ def validate_custom_filename(filename: str) -> str:
         code = ord(char)
         if code < 32 or code == 127:
             raise ValueError("文件名不能包含控制字符")
-        if char in " ._-":
+        if char in " ._-()（）":
             continue
         if "0" <= char <= "9" or "A" <= char <= "Z" or "a" <= char <= "z":
             continue
         if "\u4e00" <= char <= "\u9fff":
             continue
-        raise ValueError("文件名只允许中文、英文、数字、空格、点、下划线和短横线")
+        raise ValueError("文件名只允许中文、英文、数字、空格、点、下划线、短横线和括号")
     return name
 
 
@@ -1277,7 +1296,15 @@ def page(title: str, body: str) -> bytes:
     script = """
     function showToast(msg) {
       var el = document.getElementById('toast');
-      if (!el) { var d = document.createElement('div'); d.id='toast'; d.className='toast'; document.body.appendChild(d); el=d; }
+      if (!el) {
+        var d = document.createElement('div');
+        d.id = 'toast';
+        d.className = 'toast';
+        d.setAttribute('role', 'status');
+        d.setAttribute('aria-live', 'polite');
+        document.body.appendChild(d);
+        el = d;
+      }
       el.textContent = msg;
       el.classList.add('show');
       clearTimeout(el._t);
@@ -1690,7 +1717,7 @@ def page(title: str, body: str) -> bytes:
         var remaining = row && row.querySelector('.file-remaining');
         if (remaining) remaining.textContent = '\u5269\u4f59 ' + payload.remaining;
         closeFileMenus();
-        showToast(payload.message || '\u7eed\u671f\u6210\u529f');
+        showToast((payload.message || '\u7eed\u671f\u6210\u529f') + '\uff0c\u5269\u4f59 ' + payload.remaining);
       } catch (error) {
         showToast(error.message || '\u7eed\u671f\u5931\u8d25');
       } finally {
@@ -2051,15 +2078,18 @@ def render_home(message: str = "") -> bytes:
     return page("临时下载站", body)
 
 
-def render_view(path: Path) -> bytes:
+def render_view(path: Path, preview_count: int = 0) -> bytes:
     kind = file_kind(path.name)
     url_name = urllib.parse.quote(path.name)
     media_url = f"/media/{url_name}"
     download_url = f"/file/{url_name}"
     once_url = f"/once/{url_name}"
+    preview_label = ""
     if kind == "image":
+        preview_label = f'<p class="preview-count">点击 {max(0, preview_count)} 次</p>'
         viewer = f'<div class="viewer"><img src="{media_url}" alt="{html.escape(path.name)}"></div>'
     elif kind == "video":
+        preview_label = f'<p class="preview-count">播放/点击 {max(0, preview_count)} 次</p>'
         viewer = (
             '<div class="viewer">'
             f'<video controls preload="metadata" src="{media_url}">'
@@ -2082,6 +2112,7 @@ def render_view(path: Path) -> bytes:
   <div>
     <h1>在线预览</h1>
     <p class="code">{html.escape(path.name)}</p>
+    {preview_label}
   </div>
   <div class="actions">
     <a class="button secondary" href="/">返回文件列表</a>
@@ -2785,7 +2816,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error_page(403, "非法文件路径")
             return
-        self.send_bytes(200, render_view(path))
+        kind = file_kind(path.name)
+        preview_count = increment_preview_count(path.name) if kind in {"image", "video"} else 0
+        self.send_bytes(200, render_view(path, preview_count))
 
     def handle_media(self, encoded_name: str, head_only: bool) -> None:
         try:
