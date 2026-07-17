@@ -520,6 +520,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('data-url="/file/clip.mp4"', body)
         self.assertIn('href="/once/clip.mp4"', body)
         self.assertIn('class="menu-command renew-btn"', body)
+        self.assertIn('class="menu-command danger-text delete-file-btn"', body)
+        self.assertIn('onclick="deleteFile(this)"', body)
         self.assertIn('data-filename="clip.mp4"', body)
         self.assertNotIn('name="password"', body)
         self.assertIn('aria-expanded="false"', body)
@@ -741,6 +743,37 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_delete_file_api_requires_password_and_removes_file_metadata(self):
+        target = self.ds.DOWNLOADS_DIR / "delete-me.txt"
+        target.write_text("hello", encoding="utf-8")
+        self.ds.save_meta({target.name: {"created_at": self.ds.now_ts(), "download_count": 2.0}})
+        password = self.ds.get_admin_password()
+        server, thread, base = self.start_test_server()
+        try:
+            data = urllib.parse.urlencode({"filename": target.name, "password": "wrong"}).encode("utf-8")
+            request = urllib.request.Request(
+                f"{base}/api/delete-file",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=3)
+            self.assertEqual(error.exception.code, 403)
+            self.assertTrue(target.exists())
+
+            status, payload = self.post_form_json(
+                base, "/api/delete-file", {"filename": target.name, "password": password}
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(target.exists())
+            self.assertNotIn(target.name, self.ds.load_meta())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_page_includes_responsive_workspace_modals_and_file_menu(self):
         body = self.ds.render_home().decode("utf-8")
 
@@ -755,6 +788,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "font-size: 28px",
             ".admin-modal-overlay",
             "max-height: 88vh",
+            "resize: none",
+            "overflow-y: auto",
+            "html.dark .filter-btn.active",
+            "html:not(.light) .filter-btn.active",
             "bottom: 12px",
             "function toggleFileMenu",
             "function closeFileMenus",
@@ -783,11 +820,14 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "navigator.clipboard.readText()",
             "document.getElementById('upload-retention').value",
             "function renewFile",
+            "function deleteFile",
+            "'/api/delete-file'",
             "d.setAttribute('role', 'status')",
             "'，剩余 ' + payload.remaining",
             "function changeFilePage",
             "function applyTaskPagination",
             "FILE_PAGE_SIZE",
+            "noRowsLabel.textContent = '0 / 0'",
             "function refreshTaskPanel",
             "scheduleTaskRefresh",
             "await refreshTaskPanel()",

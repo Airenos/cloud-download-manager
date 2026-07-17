@@ -615,6 +615,17 @@ def renew_file(filename: str) -> float:
     return expires_at
 
 
+def delete_file(filename: str) -> None:
+    path = safe_download_path(filename)
+    path.unlink()
+    with META_LOCK:
+        meta = load_meta()
+        if filename in meta:
+            meta.pop(filename, None)
+            save_meta(meta)
+    append_log("delete.log", f"deleted name={filename}")
+
+
 def validate_custom_filename(filename: str) -> str:
     name = (filename or "").strip()
     if not 1 <= len(name) <= 180:
@@ -1188,7 +1199,9 @@ def page(title: str, body: str) -> bytes:
     .admin-modal-close:hover { background: var(--line); color: var(--text); }
     .admin-modal input[type=submit] { width: 100%; }
     .field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 8px; align-items: start; }
-    .field-with-action textarea { min-height: 110px; resize: vertical; }
+    .field-with-action textarea { height: 150px; min-height: 150px; resize: none; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--input-border) transparent; }
+    .field-with-action textarea::-webkit-scrollbar { width: 8px; }
+    .field-with-action textarea::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: var(--input-border); background-clip: padding-box; }
     .field-action { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; font-size: 22px; }
     input:disabled { opacity: .65; cursor: not-allowed; }
     .status-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
@@ -1272,12 +1285,14 @@ def page(title: str, body: str) -> bytes:
     html.dark .button.secondary, html.dark button.secondary { background: #2b343d; color: #d9e4ec; }
     html.dark .button.secondary:hover, html.dark button.secondary:hover { background: #35414c; }
     html.dark .filter-btn, html.dark .tag { background: #2b343d; color: #d9e4ec; }
+    html.dark .filter-btn.active, html.dark .filter-btn:hover { background: var(--primary); color: #fff; }
     html.dark .menu-command:hover { background: #2b343d; }
     @media (prefers-color-scheme: dark) {
       html:not(.light) { --bg: #14181d; --text: #e7ebef; --muted: #9aa6b2; --line: #333b44; --primary: #4da3df; --primary-dark: #2987c7; --card-bg: #1d232a; --input-bg: #161b21; --input-border: #46515d; --file-bg: #252c34; }
       html:not(.light) .button.secondary, html:not(.light) button.secondary { background: #2b343d; color: #d9e4ec; }
       html:not(.light) .button.secondary:hover, html:not(.light) button.secondary:hover { background: #35414c; }
       html:not(.light) .filter-btn, html:not(.light) .tag { background: #2b343d; color: #d9e4ec; }
+      html:not(.light) .filter-btn.active, html:not(.light) .filter-btn:hover { background: var(--primary); color: #fff; }
       html:not(.light) .menu-command:hover { background: #2b343d; }
     }
     @media (max-width: 900px) {
@@ -1614,6 +1629,15 @@ def page(title: str, body: str) -> bytes:
         if (matchType && matchSearch) matches.push(rows[i]);
         else rows[i].style.display = 'none';
       }
+      if (!rows.length) {
+        var noRowsLabel = document.getElementById('file-page-label');
+        var noRowsPrev = document.getElementById('file-page-prev');
+        var noRowsNext = document.getElementById('file-page-next');
+        if (noRowsLabel) noRowsLabel.textContent = '0 / 0';
+        if (noRowsPrev) noRowsPrev.disabled = true;
+        if (noRowsNext) noRowsNext.disabled = true;
+        return;
+      }
       var totalPages = Math.max(1, Math.ceil(matches.length / FILE_PAGE_SIZE) || 1);
       if (_filePage > totalPages) _filePage = totalPages;
       if (_filePage < 1) _filePage = 1;
@@ -1797,6 +1821,25 @@ def page(title: str, body: str) -> bytes:
         button.disabled = false;
       }
     }
+    async function deleteFile(button) {
+      if (!button || button.disabled) return;
+      var filename = button.dataset.filename || '';
+      if (!window.confirm('\u786e\u5b9a\u5220\u9664\u6587\u4ef6\u201c' + filename + '\u201d\u5417\uff1f\u6b64\u64cd\u4f5c\u65e0\u6cd5\u64a4\u9500\u3002')) return;
+      var password = window.prompt('\u8bf7\u8f93\u5165\u7ba1\u7406\u5bc6\u7801');
+      if (password === null) return;
+      button.disabled = true;
+      try {
+        var payload = await postFormJson('/api/delete-file', {filename: filename, password: password});
+        var row = button.closest('.file-row');
+        closeFileMenus();
+        if (row) row.remove();
+        _applyFilters();
+        showToast(payload.message || '\u6587\u4ef6\u5df2\u5220\u9664');
+      } catch (error) {
+        showToast(error.message || '\u5220\u9664\u5931\u8d25');
+        button.disabled = false;
+      }
+    }
     document.addEventListener('click', function(e) {
       var adminTrigger = e.target.closest && e.target.closest('[data-admin-modal]');
       if (adminTrigger) {
@@ -1933,7 +1976,10 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<button class="share-btn menu-command" type="button" '
             f'data-url="/file/{url_name}" data-name="{safe_name_attr}">二维码分享</button>'
             f'<a class="menu-command danger-text" href="/once/{url_name}">一次性下载</a>'
-            f'{renew_button}</div></div>'
+            f'{renew_button}'
+            '<button class="menu-command danger-text delete-file-btn" type="button" '
+            f'data-filename="{safe_name_attr}" onclick="deleteFile(this)">删除文件</button>'
+            '</div></div>'
         )
         actions = (
             preview
@@ -2384,6 +2430,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_clear_stopped(form)
         elif raw_path == "/api/renew":
             self.handle_renew(form)
+        elif raw_path == "/api/delete-file":
+            self.handle_delete_file(form)
         else:
             self.send_error_page(404, "接口不存在")
 
@@ -2464,6 +2512,24 @@ class DownloadHandler(BaseHTTPRequestHandler):
             "message": "续期成功",
             "remaining": format_remaining(expires_at),
         })
+
+    def handle_delete_file(self, form: dict[str, str]) -> None:
+        if not check_admin_password(form.get("password", "")):
+            self.send_json(403, {"error": "管理密码错误"})
+            return
+        filename = form.get("filename", "").strip()
+        try:
+            delete_file(filename)
+        except FileNotFoundError:
+            self.send_json(404, {"error": "文件不存在或已删除"})
+            return
+        except ValueError:
+            self.send_json(403, {"error": "非法文件路径"})
+            return
+        except OSError as exc:
+            self.send_json(500, {"error": f"删除文件失败：{exc}"})
+            return
+        self.send_json(200, {"ok": True, "message": "文件已删除"})
 
     def handle_upload_init(self, form: dict[str, str]) -> None:
         if not check_admin_password(form.get("password", "")):
