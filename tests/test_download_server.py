@@ -1,4 +1,5 @@
 import contextlib
+import http.cookiejar
 import importlib
 import json
 import os
@@ -104,6 +105,92 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
         self.assertRegex(formatted, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertNotIn("UTC+8", formatted)
+
+    def test_visitor_stats_track_active_and_recent_ips(self):
+        current = 1_700_000_000.0
+        with mock.patch.object(self.ds, "now_ts", return_value=current):
+            self.ds.record_visit("203.0.113.10", "/")
+            self.ds.record_visit("203.0.113.11", "/view/example.png")
+            stats = self.ds.get_visitor_stats(current)
+
+        self.assertEqual(stats["active"], 2)
+        self.assertEqual(stats["unique_24h"], 2)
+        self.assertEqual({item["ip"] for item in stats["recent"]}, {"203.0.113.10", "203.0.113.11"})
+
+    def test_metadata_backup_keeps_status_and_manifest(self):
+        self.ds.save_meta({"example.txt": {"created_at": 1_700_000_000.0}})
+
+        status = self.ds.create_metadata_backup()
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["count"], 1)
+        latest = status["latest"]
+        archive_path = self.ds.BACKUPS_DIR / latest["name"]
+        with self.ds.zipfile.ZipFile(archive_path) as archive:
+            self.assertIn("filemeta.json", archive.namelist())
+            self.assertIn("manifest.json", archive.namelist())
+
+    def test_admin_login_session_dashboard_backup_and_logout(self):
+        password = self.ds.get_admin_password()
+        server, thread, base = self.start_test_server()
+        cookie_jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+        try:
+            unauthorized_backup = urllib.request.Request(f"{base}/api/admin/backup", data=b"", method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as unauthorized_error:
+                urllib.request.urlopen(unauthorized_backup, timeout=3)
+            self.assertEqual(unauthorized_error.exception.code, 403)
+
+            with opener.open(f"{base}/admin/", timeout=3) as response:
+                login_page = response.read().decode("utf-8")
+            self.assertIn("管理员登录", login_page)
+            self.assertNotIn("系统监控", login_page)
+
+            login_data = urllib.parse.urlencode({"password": password}).encode("utf-8")
+            login_request = urllib.request.Request(
+                f"{base}/admin/login",
+                data=login_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "X-Forwarded-For": "203.0.113.5"},
+                method="POST",
+            )
+            with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+                with opener.open(login_request, timeout=3) as response:
+                    dashboard = response.read().decode("utf-8")
+            self.assertIn("系统监控", dashboard)
+            self.assertIn("Backup 状态", dashboard)
+            self.assertIn("203.0.113.5", dashboard)
+
+            backup_request = urllib.request.Request(f"{base}/api/admin/backup", data=b"", method="POST")
+            with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+                with opener.open(backup_request, timeout=3) as response:
+                    backup_page = response.read().decode("utf-8")
+            self.assertIn("备份完成", backup_page)
+            self.assertEqual(self.ds.get_backup_status()["count"], 1)
+
+            logout_request = urllib.request.Request(f"{base}/admin/logout", data=b"", method="POST")
+            with opener.open(logout_request, timeout=3) as response:
+                logged_out = response.read().decode("utf-8")
+            self.assertIn("管理员登录", logged_out)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_healthz_reports_service_aria_and_disk_without_secrets(self):
+        server, thread, base = self.start_test_server()
+        try:
+            with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+                with urllib.request.urlopen(f"{base}/healthz", timeout=3) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(payload["service"])
+            self.assertTrue(payload["aria2"])
+            self.assertIn("free_human", payload["disk"])
+            self.assertNotIn("password", json.dumps(payload).lower())
+            self.assertNotIn("secret", json.dumps(payload).lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_upload_session_round_trip_and_paths_are_server_derived(self):
         session = self.ds.create_upload_session("video.bin", 9, 4, 0)
@@ -491,6 +578,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertNotIn('onsubmit="return handleUpload(this)"', body)
         self.assertNotIn("Math.random()", body)
         self.assertNotIn("X-Password", body)
+        self.assertIn("await refreshFilePanel(true)", body)
+        self.assertNotIn("window.location.href = '/'", body)
         self.assertGreater(
             body.index("cancel.hidden = false"),
             body.index("session = await initUpload(form, file, selectedRetention)"),
@@ -526,6 +615,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('data-created=', body)
         self.assertIn('data-expires=', body)
         self.assertIn('class="menu-command renew-btn"', body)
+        self.assertIn("复制下载链接", body)
+        self.assertIn("copyLink('/file/clip.mp4')", body)
         self.assertIn('class="menu-command danger-text delete-file-btn"', body)
         self.assertIn('onclick="deleteFile(this)"', body)
         self.assertIn('data-filename="clip.mp4"', body)
@@ -553,6 +644,24 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertNotIn('<bad&".txt', body)
         self.assertIn("&lt;bad&amp;&quot;.txt", body)
         self.assertIn('data-filename="&lt;bad&amp;&quot;.txt"', body)
+
+    def test_file_rows_highlight_urgent_expiration(self):
+        current = 1_700_000_000.0
+        base = {
+            "url_name": "urgent.txt",
+            "file_type": "text",
+            "size_human": "1 B",
+            "created_at_text": "now",
+            "expires_at_text": "later",
+            "remaining_text": "30 分钟",
+            "retention_label": "1h",
+        }
+        with mock.patch.object(self.ds, "now_ts", return_value=current):
+            danger = self.ds.render_file_rows([{**base, "name": "danger.txt", "expires_at": current + 1800}], compact=True)
+            warning = self.ds.render_file_rows([{**base, "name": "warning.txt", "expires_at": current + 7200}], compact=True)
+
+        self.assertIn("expiry-danger", danger)
+        self.assertIn("expiry-warning", warning)
 
     def test_home_renders_status_cards_and_file_toolbar_without_legacy_sidebar(self):
         tasks = {
@@ -662,6 +771,23 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn("暂无下载任务", payload["html"])
             self.assertFalse(payload["poll"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_file_panel_api_returns_signature_html_and_stats(self):
+        target = self.ds.DOWNLOADS_DIR / "panel.txt"
+        target.write_text("hello", encoding="utf-8")
+        server, thread, base = self.start_test_server()
+        try:
+            with urllib.request.urlopen(f"{base}/api/file-panel", timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["file_count"], 1)
+            self.assertEqual(len(payload["signature"]), 16)
+            self.assertIn("panel.txt", payload["html"])
+            self.assertIn("downloads_used_human", payload["stats"])
         finally:
             server.shutdown()
             server.server_close()
@@ -851,6 +977,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "FILE_PAGE_SIZE",
             "noRowsLabel.textContent = '0 / 0'",
             "function refreshTaskPanel",
+            "function refreshFilePanel",
+            "'/api/file-panel'",
+            "sessionStorage.setItem('fileViewState'",
+            "function restoreFileViewControls",
             "scheduleTaskRefresh",
         ):
             self.assertIn(script_marker, body)

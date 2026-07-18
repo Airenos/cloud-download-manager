@@ -5,22 +5,27 @@ from __future__ import annotations
 
 import contextlib
 import email.utils
+import hashlib
 import hmac
 import html
 import io
 import json
 import mimetypes
 import os
+import platform
 import posixpath
 import re
 import secrets
 import shutil
+import sys
 import time
 import traceback
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
@@ -34,10 +39,12 @@ DATA_DIR = (APP_ROOT / "data").resolve()
 META_PATH = DATA_DIR / "filemeta.json"
 TASK_RETENTION_PATH = DATA_DIR / "task_retention.json"
 UPLOADS_DIR = (DATA_DIR / "uploads").resolve()
+BACKUPS_DIR = (DATA_DIR / "backups").resolve()
 ADMIN_PASSWORD_PATH = DATA_DIR / "admin_password.txt"
 ARIA2_SECRET_PATH = DATA_DIR / "aria2_rpc_secret.txt"
 ARIA2_RPC_URL = os.environ.get("ARIA2_RPC_URL", "http://127.0.0.1:6800/jsonrpc")
 ARIA2_RPC_TIMEOUT = float(os.environ.get("ARIA2_RPC_TIMEOUT", "3"))
+APP_STARTED_AT = time.time()
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8081"))
@@ -54,6 +61,14 @@ UPLOAD_FALLBACK_MAX_BYTES = int(
 )
 UPLOAD_LOCKS: dict[str, threading.RLock] = {}
 UPLOAD_LOCKS_GUARD = threading.Lock()
+ADMIN_SESSION_TTL_SECONDS = int(os.environ.get("ADMIN_SESSION_TTL_SECONDS", "43200"))
+ADMIN_SESSIONS: dict[str, float] = {}
+ADMIN_SESSION_LOCK = threading.RLock()
+VISITOR_LAST_SEEN: dict[str, float] = {}
+VISITOR_LOCK = threading.RLock()
+VISITOR_ACTIVE_SECONDS = 15 * 60
+MAX_TRACKED_VISITORS = 2048
+BACKUP_KEEP_COUNT = 10
 TIMEZONE_CN = timezone(timedelta(hours=8))
 
 ALLOWED_URL_PREFIXES = ("http://", "https://")
@@ -88,7 +103,7 @@ BANNED_PREFIXES = (
 
 
 def ensure_directories() -> None:
-    for directory in (DOWNLOADS_DIR, LOGS_DIR, DATA_DIR, UPLOADS_DIR):
+    for directory in (DOWNLOADS_DIR, LOGS_DIR, DATA_DIR, UPLOADS_DIR, BACKUPS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -116,6 +131,234 @@ def get_admin_password() -> str:
 
 def get_aria2_secret() -> str:
     return read_or_create_secret(ARIA2_SECRET_PATH, 24)
+
+
+def create_admin_session() -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = now_ts() + ADMIN_SESSION_TTL_SECONDS
+    with ADMIN_SESSION_LOCK:
+        prune_admin_sessions()
+        ADMIN_SESSIONS[token] = expires_at
+    return token
+
+
+def prune_admin_sessions(current: float | None = None) -> None:
+    now = now_ts() if current is None else current
+    for token, expires_at in list(ADMIN_SESSIONS.items()):
+        if expires_at <= now:
+            ADMIN_SESSIONS.pop(token, None)
+
+
+def admin_session_valid(token: str) -> bool:
+    if not token:
+        return False
+    with ADMIN_SESSION_LOCK:
+        prune_admin_sessions()
+        return ADMIN_SESSIONS.get(token, 0) > now_ts()
+
+
+def revoke_admin_session(token: str) -> None:
+    with ADMIN_SESSION_LOCK:
+        ADMIN_SESSIONS.pop(token, None)
+
+
+def sanitize_client_ip(value: str) -> str:
+    candidate = (value or "unknown").split(",", 1)[0].strip()
+    candidate = re.sub(r"[^0-9A-Fa-f:.]", "", candidate)
+    return candidate[:64] or "unknown"
+
+
+def record_visit(ip: str, path: str, current: float | None = None) -> None:
+    now = now_ts() if current is None else current
+    clean_ip = sanitize_client_ip(ip)
+    clean_path = urllib.parse.urlsplit(path).path[:240]
+    with VISITOR_LOCK:
+        cutoff = now - 86400
+        for stale_ip, seen_at in list(VISITOR_LAST_SEEN.items()):
+            if seen_at < cutoff:
+                VISITOR_LAST_SEEN.pop(stale_ip, None)
+        VISITOR_LAST_SEEN[clean_ip] = now
+        if len(VISITOR_LAST_SEEN) > MAX_TRACKED_VISITORS:
+            oldest = sorted(VISITOR_LAST_SEEN, key=VISITOR_LAST_SEEN.get)
+            for stale_ip in oldest[:len(VISITOR_LAST_SEEN) - MAX_TRACKED_VISITORS]:
+                VISITOR_LAST_SEEN.pop(stale_ip, None)
+    append_log("visitor.log", f"{clean_ip} {urllib.parse.quote(clean_path, safe='/')}")
+
+
+def read_log_tail(path: Path, max_bytes: int = 512 * 1024) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+        if size > max_bytes:
+            data = data.split(b"\n", 1)[-1]
+        return data.decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def get_visitor_stats(current: float | None = None) -> dict[str, object]:
+    now = now_ts() if current is None else current
+    cutoff_24h = now - 86400
+    recent_by_ip: dict[str, dict[str, object]] = {}
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+)$")
+    for line in read_log_tail(LOGS_DIR / "visitor.log"):
+        match = pattern.match(line)
+        if not match:
+            continue
+        try:
+            timestamp = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=TIMEZONE_CN
+            ).timestamp()
+        except ValueError:
+            continue
+        if timestamp < cutoff_24h:
+            continue
+        ip = sanitize_client_ip(match.group(2))
+        recent_by_ip[ip] = {
+            "ip": ip,
+            "last_seen": timestamp,
+            "last_seen_text": format_time(timestamp),
+            "path": urllib.parse.unquote(match.group(3)),
+        }
+    with VISITOR_LOCK:
+        active_ips = {
+            ip for ip, seen_at in VISITOR_LAST_SEEN.items()
+            if seen_at >= now - VISITOR_ACTIVE_SECONDS
+        }
+    active_ips.update(
+        ip for ip, item in recent_by_ip.items()
+        if float(item["last_seen"]) >= now - VISITOR_ACTIVE_SECONDS
+    )
+    recent = sorted(recent_by_ip.values(), key=lambda item: float(item["last_seen"]), reverse=True)
+    return {
+        "active": len(active_ips),
+        "unique_24h": len(recent_by_ip),
+        "recent": recent[:12],
+    }
+
+
+def get_recent_admin_logins(limit: int = 8) -> list[dict[str, str]]:
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+success\s+ip=(\S+)$")
+    result: list[dict[str, str]] = []
+    for line in reversed(read_log_tail(LOGS_DIR / "admin-login.log", 128 * 1024)):
+        match = pattern.match(line)
+        if not match:
+            continue
+        result.append({"time": match.group(1), "ip": sanitize_client_ip(match.group(2))})
+        if len(result) >= limit:
+            break
+    return result
+
+
+def format_duration(seconds: int | float) -> str:
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days} 天 {hours} 小时"
+    if hours:
+        return f"{hours} 小时 {minutes} 分钟"
+    return f"{minutes} 分钟"
+
+
+def get_system_metrics() -> dict[str, object]:
+    memory_total = 0
+    memory_available = 0
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        try:
+            values: dict[str, int] = {}
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.partition(":")
+                values[key] = int(raw.strip().split()[0]) * 1024
+            memory_total = values.get("MemTotal", 0)
+            memory_available = values.get("MemAvailable", 0)
+        except (OSError, ValueError, IndexError):
+            pass
+    process_rss = 0
+    process_status = Path("/proc/self/status")
+    if process_status.exists():
+        try:
+            match = re.search(r"^VmRSS:\s+(\d+)\s+kB", process_status.read_text(encoding="utf-8"), re.MULTILINE)
+            if match:
+                process_rss = int(match.group(1)) * 1024
+        except OSError:
+            pass
+    load_average: list[float] = []
+    with contextlib.suppress(OSError, AttributeError):
+        load_average = [round(value, 2) for value in os.getloadavg()]
+    memory_percent = (
+        round((memory_total - memory_available) / memory_total * 100, 1)
+        if memory_total else None
+    )
+    return {
+        "uptime": format_duration(now_ts() - APP_STARTED_AT),
+        "uptime_seconds": int(now_ts() - APP_STARTED_AT),
+        "memory_total": memory_total,
+        "memory_total_human": format_size(memory_total) if memory_total else "不可用",
+        "memory_available": memory_available,
+        "memory_available_human": format_size(memory_available) if memory_total else "不可用",
+        "memory_percent": memory_percent,
+        "process_rss": process_rss,
+        "process_rss_human": format_size(process_rss) if process_rss else "不可用",
+        "load_average": load_average,
+        "threads": threading.active_count(),
+        "python": platform.python_version(),
+        "platform": platform.system(),
+    }
+
+
+def create_metadata_backup() -> dict[str, object]:
+    ensure_directories()
+    timestamp = datetime.now(TIMEZONE_CN).strftime("%Y%m%d-%H%M%S")
+    target = BACKUPS_DIR / f"metadata-{timestamp}-{secrets.token_hex(2)}.zip"
+    manifest = {
+        "created_at": now_ts(),
+        "created_at_text": format_time(now_ts()),
+        "files": [],
+    }
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for source in (META_PATH, TASK_RETENTION_PATH):
+            if source.exists() and source.is_file():
+                archive.write(source, source.name)
+                manifest["files"].append(source.name)
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    chmod_600(target)
+    backups = sorted(BACKUPS_DIR.glob("metadata-*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for stale in backups[BACKUP_KEEP_COUNT:]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
+    append_log("backup.log", f"created name={target.name} size={target.stat().st_size}")
+    return get_backup_status()
+
+
+def get_backup_status() -> dict[str, object]:
+    ensure_directories()
+    backups = []
+    for path in BACKUPS_DIR.glob("metadata-*.zip"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        backups.append({"name": path.name, "size": stat.st_size, "created_at": stat.st_mtime})
+    backups.sort(key=lambda item: float(item["created_at"]), reverse=True)
+    latest = backups[0] if backups else None
+    return {
+        "ok": latest is not None,
+        "count": len(backups),
+        "total_size": sum(int(item["size"]) for item in backups),
+        "total_size_human": format_size(sum(int(item["size"]) for item in backups)),
+        "latest": ({
+            **latest,
+            "size_human": format_size(int(latest["size"])),
+            "created_at_text": format_time(float(latest["created_at"])),
+        } if latest else None),
+    }
 
 
 def format_size(size: int | float | None) -> str:
@@ -1203,6 +1446,20 @@ def page(title: str, body: str) -> bytes:
     .danger-confirm-error { margin: 10px 0 0; color: #b4232c; font-weight: 650; }
     .danger-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
     .danger-confirm-actions button { min-width: 88px; }
+    .admin-dashboard-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+    .admin-dashboard-grid .card { margin: 0; }
+    .admin-dashboard-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .metric-list { display: grid; gap: 0; margin: 0; }
+    .metric-row { display: flex; justify-content: space-between; gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+    .metric-row:last-child { border-bottom: 0; }
+    .metric-row dt { color: var(--muted); }
+    .metric-row dd { margin: 0; text-align: right; font-weight: 650; overflow-wrap: anywhere; }
+    .admin-login { width: min(100%, 440px); margin: 10vh auto 0; }
+    .admin-login input[type=submit] { width: 100%; margin-top: 14px; }
+    .status-good { color: #2f855a; }
+    .status-warn { color: #b7791f; }
+    .status-bad { color: #b4232c; }
+    .recent-ip-table { font-size: 13px; }
     .field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 8px; align-items: start; }
     .field-with-action textarea { height: 150px; min-height: 150px; resize: none; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--input-border) transparent; }
     .field-with-action textarea::-webkit-scrollbar { width: 8px; }
@@ -1262,6 +1519,8 @@ def page(title: str, body: str) -> bytes:
     .file-details { min-width: 0; }
     .file-name { overflow-wrap: anywhere; font-weight: 650; }
     .file-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .file-remaining.expiry-warning { color: #b7791f; font-weight: 650; }
+    .file-remaining.expiry-danger { color: #b4232c; font-weight: 700; }
     .tag { background: #edf2f5; color: #415566; }
     .file-actions { min-width: 184px; text-align: right; }
     .file-action-group { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
@@ -1314,6 +1573,8 @@ def page(title: str, body: str) -> bytes:
       .admin-modal-overlay, .danger-confirm-overlay { padding: 16px 3vw; }
       .admin-modal, .admin-modal-upload { width: 94vw; max-height: 88vh; }
       .status-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .admin-dashboard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .admin-dashboard-columns { grid-template-columns: 1fr; }
       .file-table thead { display: none; }
       .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); }
       .file-row:last-child { border-bottom: 0; }
@@ -1330,6 +1591,7 @@ def page(title: str, body: str) -> bytes:
       .file-actions { padding-left: 42px; text-align: left; }
       .file-action-group { justify-content: flex-start; }
       .file-sort { width: 100%; margin-left: 0; }
+      .admin-dashboard-grid { grid-template-columns: 1fr; }
     }
     """
     script = """
@@ -1398,6 +1660,7 @@ def page(title: str, body: str) -> bytes:
         summary.textContent = payload.summary;
         if (resetPage) _taskPage = 1;
         applyTaskPagination();
+        await refreshFilePanel(false);
         scheduleTaskRefresh(payload.poll ? 3000 : 30000);
       } catch (error) {
         scheduleTaskRefresh(15000);
@@ -1532,6 +1795,7 @@ def page(title: str, body: str) -> bytes:
       var file = form.querySelector('[name=file]').files[0];
       if (!file) return false;
       var session = null;
+      var uploadCompleted = false;
       var state = {
         activeXhrs: new Set(), loaded: [], completed: 0, active: 0,
         retries: 0, cancelled: false, render: function() {}
@@ -1584,8 +1848,14 @@ def page(title: str, body: str) -> bytes:
         status.textContent = '\u6821\u9a8c\u6587\u4ef6\u4e2d...';
         await finishUpload(session);
         bar.style.width = '100%';
-        status.textContent = '\u4e0a\u4f20\u5b8c\u6210\uff01\u6b63\u5728\u8df3\u8f6c...';
-        setTimeout(function() { window.location.href = '/'; }, 800);
+        status.textContent = '\u4e0a\u4f20\u5b8c\u6210';
+        if (uploadModal) uploadModal.dataset.busy = 'false';
+        await refreshFilePanel(true);
+        closeAdminModal(uploadModal);
+        form.reset();
+        document.getElementById('drop-file-name').textContent = '';
+        showToast('\u4e0a\u4f20\u5b8c\u6210');
+        uploadCompleted = true;
       } catch (error) {
         if (!state.cancelled) status.textContent = error.message || '\u4e0a\u4f20\u5931\u8d25';
       } finally {
@@ -1593,7 +1863,12 @@ def page(title: str, body: str) -> bytes:
         if (uploadModal) uploadModal.dataset.busy = 'false';
         cancel.hidden = true;
         submit.disabled = false;
-        submit.value = '\u91cd\u8bd5\u4e0a\u4f20';
+        submit.value = uploadCompleted ? '\u4e0a\u4f20' : '\u91cd\u8bd5\u4e0a\u4f20';
+        if (uploadCompleted) {
+          outer.classList.remove('active');
+          bar.style.width = '0%';
+          status.textContent = '';
+        }
       }
       return false;
     }
@@ -1623,13 +1898,36 @@ def page(title: str, body: str) -> bytes:
         if (det && !det.open) det.open = true;
       });
     })();
-    var _curFilter = 'all';
-    var _curSearch = '';
-    var _fileSort = 'name';
-    var _filePage = 1;
+    function readFileViewState() {
+      try { return JSON.parse(sessionStorage.getItem('fileViewState') || '{}'); }
+      catch (error) { return {}; }
+    }
+    var _savedFileView = readFileViewState();
+    var _curFilter = _savedFileView.filter || 'all';
+    var _curSearch = _savedFileView.search || '';
+    var _fileSort = _savedFileView.sort || 'name';
+    var _filePage = Math.max(1, Number(_savedFileView.page) || 1);
     var FILE_PAGE_SIZE = 6;
     var TASK_PAGE_SIZE = 5;
     var _taskPage = 1;
+    var _fileSignature = (document.getElementById('file-panel-container') || {}).dataset?.signature || '';
+    function saveFileViewState() {
+      try {
+        sessionStorage.setItem('fileViewState', JSON.stringify({
+          filter: _curFilter, search: _curSearch, sort: _fileSort, page: _filePage
+        }));
+      } catch (error) {}
+    }
+    function restoreFileViewControls() {
+      var search = document.getElementById('file-search');
+      var sort = document.getElementById('file-sort');
+      if (search) search.value = _curSearch;
+      if (sort) sort.value = _fileSort;
+      var buttons = document.querySelectorAll('.filter-btn');
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].classList.toggle('active', buttons[i].dataset.filter === _curFilter);
+      }
+    }
     function _applyFilters() {
       var rows = document.querySelectorAll('.file-row');
       var q = _curSearch.toLowerCase();
@@ -1660,6 +1958,7 @@ def page(title: str, body: str) -> bytes:
         if (noRowsLabel) noRowsLabel.textContent = '0 / 0';
         if (noRowsPrev) noRowsPrev.disabled = true;
         if (noRowsNext) noRowsNext.disabled = true;
+        saveFileViewState();
         return;
       }
       var totalPages = Math.max(1, Math.ceil(matches.length / FILE_PAGE_SIZE) || 1);
@@ -1678,6 +1977,7 @@ def page(title: str, body: str) -> bytes:
       if (label) label.textContent = _filePage + ' / ' + totalPages;
       if (prev) prev.disabled = _filePage <= 1 || matches.length === 0;
       if (next) next.disabled = _filePage >= totalPages || matches.length === 0;
+      saveFileViewState();
     }
     function changeFilePage(delta) {
       _filePage += delta;
@@ -1901,6 +2201,25 @@ def page(title: str, body: str) -> bytes:
         bar.classList.toggle('warn', !stats.disk_danger && stats.disk_percent > 80);
       }
     }
+    async function refreshFilePanel(force) {
+      var container = document.getElementById('file-panel-container');
+      if (!container) return;
+      try {
+        var response = await fetch('/api/file-panel', {cache: 'no-store'});
+        var payload = await response.json();
+        if (!response.ok || !payload.ok) return;
+        updateDiskStats(payload.stats);
+        var fileCount = document.getElementById('file-count-value');
+        if (fileCount) fileCount.textContent = String(payload.file_count);
+        if (!force && payload.signature === _fileSignature) return;
+        if (container.contains(document.activeElement)) return;
+        container.innerHTML = payload.html;
+        container.dataset.signature = payload.signature;
+        _fileSignature = payload.signature;
+        restoreFileViewControls();
+        _applyFilters();
+      } catch (error) {}
+    }
     function deleteFile(button) {
       if (!button || button.disabled) return;
       closeFileMenus();
@@ -2009,6 +2328,7 @@ def page(title: str, body: str) -> bytes:
       closeDangerConfirm();
       if (openButton) openButton.focus();
     });
+    restoreFileViewControls();
     _applyFilters();
     applyTaskPagination();
     scheduleTaskRefresh(3000);
@@ -2090,15 +2410,15 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             '</div></div>'
         )
     filter_bar = (
-        '<input class="search-box" type="text" placeholder="\u641c\u7d22\u6587\u4ef6\u540d..." oninput="searchFiles(this.value)">'
+        '<input id="file-search" class="search-box" type="text" placeholder="\u641c\u7d22\u6587\u4ef6\u540d..." oninput="searchFiles(this.value)">'
         '<div class="filter-bar">'
-        '<button class="filter-btn active" type="button" onclick="filterFiles(\'all\', this)">\u5168\u90e8</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'image\', this)">\u56fe\u7247</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'video\', this)">\u89c6\u9891</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'text\', this)">\u6587\u672c</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'document\', this)">\u6587\u6863</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'archive\', this)">\u538b\u7f29\u5305</button>'
-        '<button class="filter-btn" type="button" onclick="filterFiles(\'other\', this)">\u5176\u4ed6</button>'
+        '<button class="filter-btn active" data-filter="all" type="button" onclick="filterFiles(\'all\', this)">\u5168\u90e8</button>'
+        '<button class="filter-btn" data-filter="image" type="button" onclick="filterFiles(\'image\', this)">\u56fe\u7247</button>'
+        '<button class="filter-btn" data-filter="video" type="button" onclick="filterFiles(\'video\', this)">\u89c6\u9891</button>'
+        '<button class="filter-btn" data-filter="text" type="button" onclick="filterFiles(\'text\', this)">\u6587\u672c</button>'
+        '<button class="filter-btn" data-filter="document" type="button" onclick="filterFiles(\'document\', this)">\u6587\u6863</button>'
+        '<button class="filter-btn" data-filter="archive" type="button" onclick="filterFiles(\'archive\', this)">\u538b\u7f29\u5305</button>'
+        '<button class="filter-btn" data-filter="other" type="button" onclick="filterFiles(\'other\', this)">\u5176\u4ed6</button>'
         '<label class="sr-only" for="file-sort">文件排序</label>'
         '<select id="file-sort" class="file-sort" onchange="sortFiles(this.value)">'
         '<option value="name">名称排序</option>'
@@ -2123,6 +2443,8 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             if kind else ""
         )
         ret_label = html.escape(str(item.get("retention_label", "")))
+        remaining_seconds = float(item.get("expires_at", 0)) - now_ts()
+        expiry_class = " expiry-danger" if remaining_seconds <= 3600 else " expiry-warning" if remaining_seconds <= 21600 else ""
         renew_button = (
             '<button class="menu-command renew-btn" type="button" '
             f'data-filename="{safe_name_attr}" onclick="renewFile(this)">续期</button>'
@@ -2135,6 +2457,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             f'<div id="{menu_id}" class="file-menu-panel" hidden>'
             f'<button class="share-btn menu-command" type="button" '
             f'data-url="/file/{url_name}" data-name="{safe_name_attr}">二维码分享</button>'
+            f'<button class="menu-command" type="button" onclick="copyLink(\'/file/{url_name}\'); closeFileMenus()">复制下载链接</button>'
             f'<a class="menu-command danger-text" href="/once/{url_name}" onclick="return confirmOnceDownload(this)">一次性下载</a>'
             f'{renew_button}'
             '<button class="menu-command danger-text delete-file-btn" type="button" '
@@ -2157,7 +2480,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             '<div class="file-meta">'
             f'<span>{html.escape(str(item["size_human"]))}</span>'
             f'<span>入库 {html.escape(str(item["created_at_text"]))}</span>'
-            f'<span class="file-remaining">剩余 {html.escape(str(item["remaining_text"]))}</span>'
+            f'<span class="file-remaining{expiry_class}">剩余 {html.escape(str(item["remaining_text"]))}</span>'
             f'<span>下载 {max(0, int(item.get("download_count", 0)))} 次</span>'
             f'<span class="tag">{ret_label}</span>'
             '</div></div></div></td>'
@@ -2263,11 +2586,196 @@ def task_panel_payload(task_data: dict[str, object] | None = None) -> dict[str, 
     }
 
 
+def file_panel_signature(files: list[dict[str, object]]) -> str:
+    values = [
+        [
+            item.get("name"),
+            item.get("size"),
+            item.get("created_at"),
+            item.get("expires_at"),
+            item.get("download_count"),
+            item.get("preview_count"),
+        ]
+        for item in files
+    ]
+    values.append(["minute", int(now_ts() // 60)])
+    raw = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def file_panel_payload(files: list[dict[str, object]] | None = None) -> dict[str, object]:
+    items = scan_files() if files is None else files
+    stats = get_disk_stats()
+    return {
+        "ok": True,
+        "signature": file_panel_signature(items),
+        "html": render_file_rows(items, compact=True),
+        "file_count": len(items),
+        "stats": {
+            "downloads_used_human": stats["downloads_used_human"],
+            "free_human": stats["free_human"],
+            "disk_percent": stats["disk_percent"],
+            "disk_danger": stats["disk_danger"],
+        },
+    }
+
+
+def health_payload() -> dict[str, object]:
+    disk = get_disk_stats()
+    aria = get_aria2_tasks()
+    aria_ok = bool(aria.get("ok")) if isinstance(aria, dict) else False
+    healthy = aria_ok and not bool(disk["disk_danger"])
+    return {
+        "ok": healthy,
+        "status": "ok" if healthy else "degraded",
+        "service": True,
+        "aria2": aria_ok,
+        "disk": {
+            "free": disk["free"],
+            "free_human": disk["free_human"],
+            "downloads_used": disk["downloads_used"],
+            "downloads_used_human": disk["downloads_used_human"],
+            "danger": disk["disk_danger"],
+        },
+        "uptime_seconds": int(now_ts() - APP_STARTED_AT),
+    }
+
+
+def render_admin_login(error: str = "") -> bytes:
+    error_html = f'<div class="notice status-bad">{html.escape(error)}</div>' if error else ""
+    body = f"""
+<header class="site-header">
+  <div><h1>管理后台</h1><p>使用站点管理密码登录</p></div>
+  <div class="header-actions"><a class="button secondary" href="/">返回首页</a></div>
+</header>
+<section class="admin-login">
+  <h2>管理员登录</h2>
+  {error_html}
+  <form method="post" action="/admin/login">
+    <label for="admin-login-password">管理密码</label>
+    <input id="admin-login-password" name="password" type="password" autocomplete="current-password" required autofocus>
+    <input type="submit" value="登录">
+  </form>
+</section>
+"""
+    return page("管理后台登录", body)
+
+
+def render_admin_dashboard(message: str = "") -> bytes:
+    visitors = get_visitor_stats()
+    admin_logins = get_recent_admin_logins()
+    disk = get_disk_stats()
+    system = get_system_metrics()
+    backup = get_backup_status()
+    aria = get_aria2_tasks()
+    aria_ok = bool(aria.get("ok")) if isinstance(aria, dict) else False
+    task_items = aria.get("tasks", []) if isinstance(aria, dict) else []
+    task_count = len(task_items) if isinstance(task_items, list) else 0
+    latest = backup.get("latest")
+    latest_text = str(latest["created_at_text"]) if isinstance(latest, dict) else "尚未备份"
+    latest_size = str(latest["size_human"]) if isinstance(latest, dict) else "-"
+    memory_percent = system.get("memory_percent")
+    memory_display = f"{memory_percent}%" if memory_percent is not None else "不可用"
+    load_average = system.get("load_average")
+    load_display = " / ".join(str(value) for value in load_average) if isinstance(load_average, list) and load_average else "不可用"
+    notice = f'<div class="notice">{html.escape(message)}</div>' if message else ""
+    recent_rows = []
+    for item in visitors.get("recent", []):
+        if not isinstance(item, dict):
+            continue
+        recent_rows.append(
+            "<tr>"
+            f'<td class="code">{html.escape(str(item.get("ip", "-")))}</td>'
+            f'<td>{html.escape(str(item.get("last_seen_text", "-")))}</td>'
+            f'<td class="code">{html.escape(str(item.get("path", "-")))}</td>'
+            "</tr>"
+        )
+    recent_html = (
+        '<table class="recent-ip-table"><thead><tr><th>IP</th><th>最近访问</th><th>页面</th></tr></thead>'
+        f'<tbody>{"".join(recent_rows)}</tbody></table>'
+        if recent_rows else '<div class="empty">暂无访问记录</div>'
+    )
+    login_rows = "".join(
+        '<tr>'
+        f'<td class="code">{html.escape(item["ip"])}</td>'
+        f'<td>{html.escape(item["time"])}</td>'
+        '</tr>'
+        for item in admin_logins
+    )
+    login_html = (
+        '<table class="recent-ip-table"><thead><tr><th>登录 IP</th><th>登录时间</th></tr></thead>'
+        f'<tbody>{login_rows}</tbody></table>'
+        if login_rows else '<div class="empty">暂无后台登录记录</div>'
+    )
+    body = f"""
+<header class="site-header">
+  <div><h1>管理后台</h1><p>访问、备份与系统状态</p></div>
+  <div class="header-actions">
+    <a class="button secondary" href="/">首页</a>
+    <a class="button secondary" href="/admin/">刷新</a>
+    <form class="inline" method="post" action="/admin/logout"><button class="secondary" type="submit">退出</button></form>
+    <button class="icon-button theme-toggle" type="button" onclick="toggleTheme()" aria-label="切换主题" title="切换主题">◐</button>
+  </div>
+</header>
+{notice}
+<div class="admin-dashboard-grid">
+  <div class="card"><span class="card-label">近 15 分钟活跃 IP</span><strong>{int(visitors["active"])}</strong></div>
+  <div class="card"><span class="card-label">近 24 小时访问人数</span><strong>{int(visitors["unique_24h"])}</strong></div>
+  <div class="card"><span class="card-label">下载目录占用</span><strong>{html.escape(str(disk["downloads_used_human"]))}</strong></div>
+  <div class="card"><span class="card-label">系统内存使用</span><strong>{html.escape(memory_display)}</strong></div>
+</div>
+<div class="admin-dashboard-columns">
+  <section>
+    <div class="section-heading"><h2>系统监控</h2><span class="tag {'status-good' if not disk['disk_danger'] else 'status-bad'}">{'正常' if not disk['disk_danger'] else '空间不足'}</span></div>
+    <dl class="metric-list">
+      <div class="metric-row"><dt>服务运行时间</dt><dd>{html.escape(str(system["uptime"]))}</dd></div>
+      <div class="metric-row"><dt>系统可用内存</dt><dd>{html.escape(str(system["memory_available_human"]))} / {html.escape(str(system["memory_total_human"]))}</dd></div>
+      <div class="metric-row"><dt>Python 进程内存</dt><dd>{html.escape(str(system["process_rss_human"]))}</dd></div>
+      <div class="metric-row"><dt>Load Average</dt><dd>{html.escape(load_display)}</dd></div>
+      <div class="metric-row"><dt>活动线程</dt><dd>{int(system["threads"])}</dd></div>
+      <div class="metric-row"><dt>运行环境</dt><dd>{html.escape(str(system["platform"]))} / Python {html.escape(str(system["python"]))}</dd></div>
+    </dl>
+  </section>
+  <section>
+    <div class="section-heading"><h2>服务与存储</h2><span class="tag {'status-good' if aria_ok else 'status-bad'}">aria2 {'正常' if aria_ok else '不可用'}</span></div>
+    <dl class="metric-list">
+      <div class="metric-row"><dt>磁盘剩余</dt><dd>{html.escape(str(disk["free_human"]))} / {html.escape(str(disk["total_human"]))}</dd></div>
+      <div class="metric-row"><dt>磁盘使用率</dt><dd>{float(disk["disk_percent"]):.1f}%</dd></div>
+      <div class="metric-row"><dt>临时文件占用</dt><dd>{html.escape(str(disk["downloads_used_human"]))}</dd></div>
+      <div class="metric-row"><dt>可用文件</dt><dd>{len(scan_files())}</dd></div>
+      <div class="metric-row"><dt>aria2 任务</dt><dd>{task_count}</dd></div>
+      <div class="metric-row"><dt>健康检查</dt><dd><a href="/healthz">/healthz</a></dd></div>
+    </dl>
+  </section>
+</div>
+<div class="admin-dashboard-columns">
+  <section>
+    <div class="section-heading"><div><h2>Backup 状态</h2><p>仅备份文件元数据和任务保留配置</p></div></div>
+    <dl class="metric-list">
+      <div class="metric-row"><dt>最近备份</dt><dd>{html.escape(latest_text)}</dd></div>
+      <div class="metric-row"><dt>最近大小</dt><dd>{html.escape(latest_size)}</dd></div>
+      <div class="metric-row"><dt>保留份数</dt><dd>{int(backup["count"])} / {BACKUP_KEEP_COUNT}</dd></div>
+      <div class="metric-row"><dt>备份总占用</dt><dd>{html.escape(str(backup["total_size_human"]))}</dd></div>
+    </dl>
+    <form method="post" action="/api/admin/backup"><button type="submit">立即备份元数据</button></form>
+  </section>
+  <section>
+    <div class="section-heading"><h2>最近登录 IP</h2></div>
+    {login_html}
+    <div class="section-heading"><h2>最近访问 IP</h2><span class="tag">近 24 小时</span></div>
+    {recent_html}
+  </section>
+</div>
+"""
+    return page("管理后台", body)
+
+
 def render_home(message: str = "") -> bytes:
     cleanup_expired()
     tasks = get_aria2_tasks()
     files = scan_files()
     stats = get_disk_stats()
+    initial_file_signature = file_panel_signature(files)
     task_panel = task_panel_payload(tasks)
     task_summary = str(task_panel["summary"])
     task_html = str(task_panel["html"])
@@ -2279,6 +2787,7 @@ def render_home(message: str = "") -> bytes:
     <p>给朋友分享临时文件</p>
   </div>
   <div class="header-actions">
+    <a class="icon-button button secondary" href="/admin/" aria-label="管理后台" title="管理后台">⚙</a>
     <button class="icon-button secondary" type="button" onclick="location.reload()" aria-label="刷新" title="刷新">↻</button>
     <button class="icon-button theme-toggle" type="button" onclick="toggleTheme()" aria-label="切换主题" title="切换主题">◐</button>
   </div>
@@ -2308,7 +2817,7 @@ def render_home(message: str = "") -> bytes:
             </button>
           </div>
         </div>
-        {render_file_rows(files, compact=True)}
+        <div id="file-panel-container" data-signature="{initial_file_signature}">{render_file_rows(files, compact=True)}</div>
       </section>
       <section class="task-panel">
         <div class="section-heading">
@@ -2464,7 +2973,33 @@ class DownloadHandler(BaseHTTPRequestHandler):
     server_version = "TempDownloadServer/1.0"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        append_log("access.log", f"{self.client_address[0]} {fmt % args}")
+        append_log("access.log", f"{self.client_ip()} {fmt % args}")
+
+    def client_ip(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        return sanitize_client_ip(forwarded or self.client_address[0])
+
+    def admin_session_token(self) -> str:
+        cookie = SimpleCookie()
+        with contextlib.suppress(Exception):
+            cookie.load(self.headers.get("Cookie", ""))
+        morsel = cookie.get("admin_session")
+        return morsel.value if morsel else ""
+
+    def admin_authenticated(self) -> bool:
+        return admin_session_valid(self.admin_session_token())
+
+    def admin_cookie(self, token: str, max_age: int) -> str:
+        parts = [
+            f"admin_session={token}",
+            "Path=/",
+            f"Max-Age={max_age}",
+            "HttpOnly",
+            "SameSite=Strict",
+        ]
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            parts.append("Secure")
+        return "; ".join(parts)
 
     def send_bytes(
         self,
@@ -2488,8 +3023,15 @@ class DownloadHandler(BaseHTTPRequestHandler):
     def send_json(self, status: int, payload: dict[str, object]) -> None:
         self.send_bytes(status, json_bytes(payload), "application/json; charset=utf-8")
 
-    def send_redirect(self, location: str, status: int = 302) -> None:
-        self.send_bytes(status, b"", "text/plain; charset=utf-8", {"Location": location})
+    def send_redirect(
+        self,
+        location: str,
+        status: int = 302,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        response_headers = {"Location": location}
+        response_headers.update(headers or {})
+        self.send_bytes(status, b"", "text/plain; charset=utf-8", response_headers)
 
     def normalized_path(self) -> str:
         raw_path = urllib.parse.urlsplit(self.path).path
@@ -2524,6 +3066,9 @@ class DownloadHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
+            raw_path = urllib.parse.urlsplit(self.path).path
+            if raw_path == "/" or raw_path.startswith("/view/"):
+                record_visit(self.client_ip(), self.path)
             self.route_get()
         except Exception:
             append_log("error.log", traceback.format_exc())
@@ -2536,6 +3081,17 @@ class DownloadHandler(BaseHTTPRequestHandler):
         raw_path = urllib.parse.urlsplit(self.path).path
         if raw_path == "/":
             self.send_bytes(200, render_home())
+        elif raw_path == "/admin":
+            self.send_redirect("/admin/")
+        elif raw_path == "/admin/":
+            if not self.admin_authenticated():
+                self.send_bytes(200, render_admin_login())
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            message = query.get("message", [""])[-1]
+            self.send_bytes(200, render_admin_dashboard(message))
+        elif raw_path == "/healthz":
+            self.send_json(200, health_payload())
         elif raw_path == "/downloads/":
             self.send_redirect("/")
         elif raw_path == "/api/stats":
@@ -2547,6 +3103,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.send_bytes(200, json_bytes(get_aria2_tasks()), "application/json; charset=utf-8")
         elif raw_path == "/api/task-panel":
             self.send_json(200, task_panel_payload())
+        elif raw_path == "/api/file-panel":
+            self.send_json(200, file_panel_payload())
         elif raw_path.startswith("/view/"):
             self.handle_view(raw_path.removeprefix("/view/"))
         elif raw_path.startswith("/media/"):
@@ -2577,7 +3135,13 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_upload_chunk()
             return
         form = parse_form(self)
-        if raw_path == "/api/upload_init":
+        if raw_path == "/admin/login":
+            self.handle_admin_login(form)
+        elif raw_path == "/admin/logout":
+            self.handle_admin_logout()
+        elif raw_path == "/api/admin/backup":
+            self.handle_admin_backup()
+        elif raw_path == "/api/upload_init":
             self.handle_upload_init(form)
         elif raw_path == "/api/upload_finish":
             self.handle_upload_finish(form)
@@ -2595,6 +3159,44 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_delete_file(form)
         else:
             self.send_error_page(404, "接口不存在")
+
+    def handle_admin_login(self, form: dict[str, str]) -> None:
+        ip = self.client_ip()
+        if not check_admin_password(form.get("password", "")):
+            append_log("admin-login.log", f"failed ip={ip}")
+            self.send_bytes(403, render_admin_login("管理密码错误"))
+            return
+        token = create_admin_session()
+        append_log("admin-login.log", f"success ip={ip}")
+        self.send_redirect(
+            "/admin/",
+            303,
+            {"Set-Cookie": self.admin_cookie(token, ADMIN_SESSION_TTL_SECONDS)},
+        )
+
+    def handle_admin_logout(self) -> None:
+        revoke_admin_session(self.admin_session_token())
+        self.send_redirect(
+            "/admin/",
+            303,
+            {"Set-Cookie": self.admin_cookie("", 0)},
+        )
+
+    def handle_admin_backup(self) -> None:
+        if not self.admin_authenticated():
+            self.send_error_page(403, "管理员会话无效，请重新登录")
+            return
+        try:
+            status = create_metadata_backup()
+        except Exception as exc:
+            append_log("backup.log", f"failed error={type(exc).__name__}")
+            message = urllib.parse.quote(f"备份失败：{exc}")
+            self.send_redirect(f"/admin/?message={message}", 303)
+            return
+        latest = status.get("latest")
+        name = str(latest.get("name")) if isinstance(latest, dict) else "metadata"
+        message = urllib.parse.quote(f"备份完成：{name}")
+        self.send_redirect(f"/admin/?message={message}", 303)
 
     def handle_add_task(self, form: dict[str, str]) -> None:
         if not check_admin_password(form.get("password", "")):

@@ -21,6 +21,10 @@
 - 删除文件后首页会立即更新文件数量、目录占用、剩余空间和磁盘状态条。
 - 图片和视频预览页显示预览次数；每次打开预览页计一次，视频 Range 请求不重复计数。
 - 自定义文件名支持中文、英文、数字、空格、点、下划线、短横线，以及半角/全角括号。
+- 文件任务完成和本地上传后自动刷新文件面板；搜索、类型、排序和分页状态在当前标签页保留。
+- 文件菜单可直接复制下载链接，剩余 6 小时/1 小时内分别使用警告/危险颜色。
+- 轻量管理后台：访问 IP、后台登录 IP、Backup 状态、存储、内存、负载、进程和 aria2 监控。
+- `/healthz` 提供不含密码和 secret 的部署健康状态。
 
 仅用于合法资源临时中转，请勿下载或传播侵权内容。
 
@@ -42,7 +46,8 @@
 │   └── .gitkeep
 ├── data/
 │   ├── .gitkeep
-│   └── uploads/            # 运行时上传会话 JSON
+│   ├── uploads/            # 运行时上传会话 JSON
+│   └── backups/            # 后台创建的元数据 ZIP，最多保留 10 份
 └── tests/
     └── test_download_server.py
 ```
@@ -127,6 +132,20 @@ cat data/admin_password.txt
 
 旧地址 `/downloads/` 会重定向到首页，书签和历史链接仍可继续使用。
 
+## 管理后台
+
+访问 `/admin/`，使用 `data/admin_password.txt` 中的管理密码登录。会话默认保留 12 小时，使用 HttpOnly、SameSite=Strict Cookie；服务重启后需要重新登录。
+
+后台统计口径：
+
+- 活跃人数：最近 15 分钟访问首页或预览页的独立 IP。
+- 访问人数：最近 24 小时独立 IP，记录保存在 `logs/visitor.log`。
+- 最近登录 IP：成功登录管理后台的 IP，记录保存在 `logs/admin-login.log`。
+- 系统监控：Linux 从 `/proc` 读取内存和当前 Python 进程 RSS；不支持的平台显示“不可用”。
+- Backup：只备份 `filemeta.json` 和 `task_retention.json`，不复制下载文件、密码或 aria2 secret，最多保留 10 份。
+
+健康检查地址为 `/healthz`。aria2 不可用或磁盘低于安全阈值时返回 `status: degraded`，HTTP 服务仍返回 200，便于区分“服务存活”和“依赖降级”。
+
 ## 在线预览
 
 支持图片：
@@ -170,6 +189,7 @@ UPLOAD_CHUNK_BYTES=5242880
 UPLOAD_CONCURRENCY=3
 UPLOAD_SESSION_TTL_SECONDS=21600
 UPLOAD_FALLBACK_MAX_BYTES=52428800
+ADMIN_SESSION_TTL_SECONDS=43200
 ```
 
 说明：
@@ -182,6 +202,7 @@ UPLOAD_FALLBACK_MAX_BYTES=52428800
 - `UPLOAD_CONCURRENCY` 是浏览器并发 worker 数，默认 3；隧道不稳定时可降为 1 或 2。
 - `UPLOAD_SESSION_TTL_SECONDS` 是未完成上传的保留时间，默认 6 小时。
 - `UPLOAD_FALLBACK_MAX_BYTES` 是传统 multipart 上传上限，默认 50MiB。
+- `ADMIN_SESSION_TTL_SECONDS` 是管理后台会话期限，默认 12 小时。
 
 ## 清理
 
@@ -213,6 +234,14 @@ logs/once-download.log
 
 ```text
 logs/upload.log
+```
+
+访问与后台登录日志：
+
+```text
+logs/visitor.log
+logs/admin-login.log
+logs/backup.log
 ```
 
 典型分片记录包含 `read_ms`、`write_ms` 和 `total_ms`：
