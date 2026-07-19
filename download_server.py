@@ -33,6 +33,7 @@ import threading
 APP_ROOT = Path(os.environ.get("APP_ROOT", Path(__file__).resolve().parent)).resolve()
 META_LOCK = threading.RLock()
 TASK_RETENTION_LOCK = threading.RLock()
+BACKUP_LOCK = threading.RLock()
 DOWNLOADS_DIR = (APP_ROOT / "downloads").resolve()
 LOGS_DIR = (APP_ROOT / "logs").resolve()
 DATA_DIR = (APP_ROOT / "data").resolve()
@@ -64,11 +65,30 @@ UPLOAD_LOCKS_GUARD = threading.Lock()
 ADMIN_SESSION_TTL_SECONDS = int(os.environ.get("ADMIN_SESSION_TTL_SECONDS", "43200"))
 ADMIN_SESSIONS: dict[str, float] = {}
 ADMIN_SESSION_LOCK = threading.RLock()
+ADMIN_LOGIN_MAX_FAILURES = max(1, int(os.environ.get("ADMIN_LOGIN_MAX_FAILURES", "5")))
+ADMIN_LOGIN_WINDOW_SECONDS = max(60, int(os.environ.get("ADMIN_LOGIN_WINDOW_SECONDS", "600")))
+ADMIN_LOGIN_BLOCK_SECONDS = max(60, int(os.environ.get("ADMIN_LOGIN_BLOCK_SECONDS", "600")))
+ADMIN_LOGIN_FAILURES: dict[str, list[float]] = {}
+ADMIN_LOGIN_BLOCKED_UNTIL: dict[str, float] = {}
+ADMIN_LOGIN_GUARD_LOCK = threading.RLock()
+MAX_TRACKED_LOGIN_IPS = 2048
 VISITOR_LAST_SEEN: dict[str, float] = {}
 VISITOR_LOCK = threading.RLock()
 VISITOR_ACTIVE_SECONDS = 15 * 60
 MAX_TRACKED_VISITORS = 2048
 BACKUP_KEEP_COUNT = 10
+MAINTENANCE_INTERVAL_SECONDS = max(60, int(os.environ.get("MAINTENANCE_INTERVAL_SECONDS", "3600")))
+AUTO_BACKUP_INTERVAL_SECONDS = max(300, int(os.environ.get("AUTO_BACKUP_INTERVAL_SECONDS", "86400")))
+MAINTENANCE_STATE: dict[str, object] = {
+    "last_run": 0.0,
+    "last_run_text": "尚未运行",
+    "last_removed": 0,
+    "last_backup": False,
+    "last_error": "",
+}
+MAINTENANCE_LOCK = threading.RLock()
+LOGGED_TASK_FAILURES: set[str] = set()
+TASK_FAILURE_LOCK = threading.RLock()
 TIMEZONE_CN = timezone(timedelta(hours=8))
 
 ALLOWED_URL_PREFIXES = ("http://", "https://")
@@ -162,10 +182,70 @@ def revoke_admin_session(token: str) -> None:
         ADMIN_SESSIONS.pop(token, None)
 
 
+def admin_login_retry_after(ip: str, current: float | None = None) -> int:
+    now = now_ts() if current is None else current
+    clean_ip = sanitize_client_ip(ip)
+    with ADMIN_LOGIN_GUARD_LOCK:
+        blocked_until = ADMIN_LOGIN_BLOCKED_UNTIL.get(clean_ip, 0.0)
+        if blocked_until > now:
+            return max(1, int(blocked_until - now + 0.999))
+        ADMIN_LOGIN_BLOCKED_UNTIL.pop(clean_ip, None)
+        cutoff = now - ADMIN_LOGIN_WINDOW_SECONDS
+        attempts = [value for value in ADMIN_LOGIN_FAILURES.get(clean_ip, []) if value >= cutoff]
+        if attempts:
+            ADMIN_LOGIN_FAILURES[clean_ip] = attempts
+        else:
+            ADMIN_LOGIN_FAILURES.pop(clean_ip, None)
+        return 0
+
+
+def record_admin_login_failure(ip: str, current: float | None = None) -> int:
+    now = now_ts() if current is None else current
+    clean_ip = sanitize_client_ip(ip)
+    with ADMIN_LOGIN_GUARD_LOCK:
+        retry_after = admin_login_retry_after(clean_ip, now)
+        if retry_after:
+            return retry_after
+        cutoff = now - ADMIN_LOGIN_WINDOW_SECONDS
+        attempts = [value for value in ADMIN_LOGIN_FAILURES.get(clean_ip, []) if value >= cutoff]
+        attempts.append(now)
+        ADMIN_LOGIN_FAILURES[clean_ip] = attempts
+        if len(attempts) >= ADMIN_LOGIN_MAX_FAILURES:
+            blocked_until = now + ADMIN_LOGIN_BLOCK_SECONDS
+            ADMIN_LOGIN_BLOCKED_UNTIL[clean_ip] = blocked_until
+            ADMIN_LOGIN_FAILURES.pop(clean_ip, None)
+            retry_after = ADMIN_LOGIN_BLOCK_SECONDS
+        tracked = set(ADMIN_LOGIN_FAILURES) | set(ADMIN_LOGIN_BLOCKED_UNTIL)
+        if len(tracked) > MAX_TRACKED_LOGIN_IPS:
+            stale = sorted(
+                tracked,
+                key=lambda value: max(
+                    ADMIN_LOGIN_BLOCKED_UNTIL.get(value, 0.0),
+                    max(ADMIN_LOGIN_FAILURES.get(value, [0.0])),
+                ),
+            )
+            for value in stale[:len(tracked) - MAX_TRACKED_LOGIN_IPS]:
+                ADMIN_LOGIN_FAILURES.pop(value, None)
+                ADMIN_LOGIN_BLOCKED_UNTIL.pop(value, None)
+        return retry_after
+
+
+def clear_admin_login_failures(ip: str) -> None:
+    clean_ip = sanitize_client_ip(ip)
+    with ADMIN_LOGIN_GUARD_LOCK:
+        ADMIN_LOGIN_FAILURES.pop(clean_ip, None)
+        ADMIN_LOGIN_BLOCKED_UNTIL.pop(clean_ip, None)
+
+
 def sanitize_client_ip(value: str) -> str:
     candidate = (value or "unknown").split(",", 1)[0].strip()
     candidate = re.sub(r"[^0-9A-Fa-f:.]", "", candidate)
     return candidate[:64] or "unknown"
+
+
+def compact_log_value(value: object, limit: int = 240) -> str:
+    compact = " ".join(str(value or "").split())
+    return compact[:limit] or "-"
 
 
 def record_visit(ip: str, path: str, current: float | None = None) -> None:
@@ -314,27 +394,32 @@ def get_system_metrics() -> dict[str, object]:
 
 
 def create_metadata_backup() -> dict[str, object]:
-    ensure_directories()
-    timestamp = datetime.now(TIMEZONE_CN).strftime("%Y%m%d-%H%M%S")
-    target = BACKUPS_DIR / f"metadata-{timestamp}-{secrets.token_hex(2)}.zip"
-    manifest = {
-        "created_at": now_ts(),
-        "created_at_text": format_time(now_ts()),
-        "files": [],
-    }
-    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for source in (META_PATH, TASK_RETENTION_PATH):
-            if source.exists() and source.is_file():
-                archive.write(source, source.name)
-                manifest["files"].append(source.name)
-        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-    chmod_600(target)
-    backups = sorted(BACKUPS_DIR.glob("metadata-*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)
-    for stale in backups[BACKUP_KEEP_COUNT:]:
-        with contextlib.suppress(OSError):
-            stale.unlink()
-    append_log("backup.log", f"created name={target.name} size={target.stat().st_size}")
-    return get_backup_status()
+    with BACKUP_LOCK:
+        ensure_directories()
+        timestamp = datetime.now(TIMEZONE_CN).strftime("%Y%m%d-%H%M%S")
+        target = BACKUPS_DIR / f"metadata-{timestamp}-{secrets.token_hex(2)}.zip"
+        manifest = {
+            "created_at": now_ts(),
+            "created_at_text": format_time(now_ts()),
+            "files": [],
+        }
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source in (META_PATH, TASK_RETENTION_PATH):
+                if source.exists() and source.is_file():
+                    archive.write(source, source.name)
+                    manifest["files"].append(source.name)
+            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        chmod_600(target)
+        backups = sorted(
+            BACKUPS_DIR.glob("metadata-*.zip"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in backups[BACKUP_KEEP_COUNT:]:
+            with contextlib.suppress(OSError):
+                stale.unlink()
+        append_log("backup.log", f"created name={target.name} size={target.stat().st_size}")
+        return get_backup_status()
 
 
 def get_backup_status() -> dict[str, object]:
@@ -359,6 +444,96 @@ def get_backup_status() -> dict[str, object]:
             "created_at_text": format_time(float(latest["created_at"])),
         } if latest else None),
     }
+
+
+def run_maintenance_cycle(current: float | None = None) -> dict[str, object]:
+    started = time.monotonic()
+    now = now_ts() if current is None else current
+    removed_count = 0
+    backup_created = False
+    error = ""
+    try:
+        removed_count = len(cleanup_expired())
+        backup = get_backup_status()
+        latest = backup.get("latest")
+        latest_at = float(latest.get("created_at", 0)) if isinstance(latest, dict) else 0.0
+        if not latest_at or now - latest_at >= AUTO_BACKUP_INTERVAL_SECONDS:
+            create_metadata_backup()
+            backup_created = True
+    except Exception as exc:
+        error = compact_log_value(exc)
+        append_log("maintenance.log", f"failed error={type(exc).__name__} detail={error}")
+    duration_ms = round((time.monotonic() - started) * 1000)
+    state = {
+        "last_run": now,
+        "last_run_text": format_time(now),
+        "last_removed": removed_count,
+        "last_backup": backup_created,
+        "last_error": error,
+        "duration_ms": duration_ms,
+    }
+    with MAINTENANCE_LOCK:
+        MAINTENANCE_STATE.update(state)
+    if not error:
+        append_log(
+            "maintenance.log",
+            f"completed removed={removed_count} backup={'created' if backup_created else 'current'} "
+            f"duration_ms={duration_ms}",
+        )
+    return dict(state)
+
+
+def get_maintenance_status() -> dict[str, object]:
+    with MAINTENANCE_LOCK:
+        return dict(MAINTENANCE_STATE)
+
+
+def maintenance_worker(stop_event: threading.Event) -> None:
+    while not stop_event.wait(MAINTENANCE_INTERVAL_SECONDS):
+        run_maintenance_cycle()
+
+
+def get_recent_events(limit: int = 20) -> list[dict[str, str]]:
+    sources = {
+        "task.log": "下载任务",
+        "upload.log": "文件上传",
+        "cleanup.log": "过期清理",
+        "backup.log": "元数据备份",
+        "maintenance.log": "自动维护",
+        "error.log": "服务错误",
+    }
+    events: list[dict[str, object]] = []
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(.+)$")
+    for log_name, label in sources.items():
+        for line in read_log_tail(LOGS_DIR / log_name, 128 * 1024):
+            match = pattern.match(line)
+            if not match:
+                continue
+            try:
+                timestamp = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=TIMEZONE_CN
+                ).timestamp()
+            except ValueError:
+                continue
+            message = compact_log_value(match.group(2))
+            lowered = message.lower()
+            level = "bad" if log_name == "error.log" or "failed" in lowered or "error=" in lowered else "good"
+            if "cancel" in lowered or "interrupted" in lowered:
+                level = "warn"
+            events.append(
+                {
+                    "timestamp": timestamp,
+                    "time": match.group(1),
+                    "source": label,
+                    "message": message,
+                    "level": level,
+                }
+            )
+    events.sort(key=lambda item: float(item["timestamp"]), reverse=True)
+    return [
+        {key: str(value) for key, value in item.items() if key != "timestamp"}
+        for item in events[:max(0, limit)]
+    ]
 
 
 def format_size(size: int | float | None) -> str:
@@ -800,8 +975,12 @@ def scan_files() -> list[dict[str, object]]:
 def append_log(log_name: str, message: str) -> None:
     ensure_directories()
     line = f"{format_time(now_ts())} {message}\n"
-    with (LOGS_DIR / log_name).open("a", encoding="utf-8") as f:
-        f.write(line)
+    try:
+        with (LOGS_DIR / log_name).open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        # Diagnostics must never make the download service unavailable.
+        return
 
 
 def cleanup_expired() -> list[str]:
@@ -1082,6 +1261,7 @@ def clear_stopped_tasks() -> int:
             if gid:
                 with contextlib.suppress(Exception):
                     aria2_rpc("aria2.removeDownloadResult", [gid])
+                    forget_task_retention(str(gid))
                     count += 1
     return count
 
@@ -1102,6 +1282,57 @@ def task_name(task: dict[str, object]) -> str:
     return str(task.get("gid", "未知任务"))
 
 
+ARIA2_ERROR_MESSAGES = {
+    "1": "未知错误",
+    "2": "连接超时",
+    "3": "资源未找到",
+    "4": "资源多次未找到",
+    "5": "下载速度过低而中止",
+    "6": "网络连接异常",
+    "7": "任务未完成",
+    "8": "远端不支持断点续传",
+    "9": "磁盘空间不足",
+    "13": "目标文件已存在",
+    "14": "文件重命名失败",
+    "15": "无法打开已有文件",
+    "16": "无法创建文件",
+    "17": "文件系统错误",
+    "18": "无法创建目录",
+    "19": "域名解析失败",
+    "22": "HTTP 响应头无效",
+    "23": "重定向次数过多",
+    "24": "HTTP 鉴权失败",
+    "27": "磁力链接无效",
+    "29": "远端无法恢复下载",
+}
+
+
+def task_source_url(task: dict[str, object]) -> str:
+    files = task.get("files")
+    if not isinstance(files, list):
+        return ""
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        uris = item.get("uris")
+        if not isinstance(uris, list):
+            continue
+        for uri_item in uris:
+            if isinstance(uri_item, dict) and uri_item.get("uri"):
+                value = str(uri_item["uri"])
+                if value.startswith(ALLOWED_URL_PREFIXES):
+                    return value
+    return ""
+
+
+def task_error_text(task: dict[str, object]) -> str:
+    code = str(task.get("errorCode") or "")
+    raw_message = compact_log_value(task.get("errorMessage"), 320)
+    fallback = ARIA2_ERROR_MESSAGES.get(code, "下载失败")
+    message = raw_message if raw_message != "-" else fallback
+    return f"aria2 错误 {code}：{message}" if code else message
+
+
 def normalize_task(task: dict[str, object]) -> dict[str, object]:
     name = task_name(task)
     status = str(task.get("status", "-"))
@@ -1110,6 +1341,7 @@ def normalize_task(task: dict[str, object]) -> dict[str, object]:
     speed = int(task.get("downloadSpeed") or 0)
     progress = round((completed / total) * 100, 1) if total else 0.0
     hint = ""
+    error_text = task_error_text(task) if status == "error" else ""
     return {
         "gid": str(task.get("gid", "")),
         "name": name,
@@ -1122,7 +1354,77 @@ def normalize_task(task: dict[str, object]) -> dict[str, object]:
         "total": total,
         "total_human": format_size(total),
         "hint": hint,
+        "error": error_text,
+        "retryable": status == "error" and bool(task_source_url(task)),
     }
+
+
+def retry_aria2_task(gid: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{1,32}", gid or ""):
+        raise ValueError("非法 GID")
+    task = aria2_rpc(
+        "aria2.tellStatus",
+        [gid, ["gid", "status", "errorCode", "errorMessage", "files"]],
+    )
+    if not isinstance(task, dict) or str(task.get("status", "")) != "error":
+        raise ValueError("只有失败任务可以重试")
+    url = task_source_url(task)
+    if not url:
+        raise ValueError("任务没有可重试的 HTTP/HTTPS 来源")
+    ensure_can_add_task(url)
+    options: dict[str, str] = {
+        "dir": str(DOWNLOADS_DIR),
+        "continue": "true",
+        "auto-file-renaming": "false",
+    }
+    files = task.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if not isinstance(item, dict) or not item.get("path"):
+                continue
+            candidate = Path(str(item["path"]))
+            if not candidate.is_absolute():
+                candidate = DOWNLOADS_DIR / candidate
+            candidate = candidate.resolve()
+            with contextlib.suppress(ValueError):
+                candidate.relative_to(DOWNLOADS_DIR)
+                if candidate.parent == DOWNLOADS_DIR and candidate.name:
+                    options["out"] = candidate.name
+                    break
+    with TASK_RETENTION_LOCK:
+        retention = load_task_retentions().get(gid, 0)
+    result = aria2_rpc("aria2.addUri", [[url], options])
+    if not isinstance(result, str):
+        raise RuntimeError("aria2 未返回新任务 GID")
+    if retention in RETENTION_OPTIONS_SET:
+        remember_task_retention(result, retention)
+    with contextlib.suppress(Exception):
+        aria2_rpc("aria2.removeDownloadResult", [gid])
+    forget_task_retention(gid)
+    with TASK_FAILURE_LOCK:
+        LOGGED_TASK_FAILURES.discard(gid)
+    append_log("task.log", f"retried old_gid={gid} new_gid={result} name={compact_log_value(task_name(task))}")
+    return result
+
+
+def record_task_failures(tasks: list[object]) -> None:
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")) != "error":
+            continue
+        gid = str(task.get("gid", ""))
+        if not gid:
+            continue
+        with TASK_FAILURE_LOCK:
+            if gid in LOGGED_TASK_FAILURES:
+                continue
+            if len(LOGGED_TASK_FAILURES) >= 2048:
+                LOGGED_TASK_FAILURES.clear()
+            LOGGED_TASK_FAILURES.add(gid)
+        append_log(
+            "task.log",
+            f"failed gid={gid} name={compact_log_value(task_name(task))} "
+            f"error={compact_log_value(task_error_text(task))}",
+        )
 
 
 def sync_task_retentions(tasks: list[object]) -> None:
@@ -1142,7 +1444,7 @@ def sync_task_retentions(tasks: list[object]) -> None:
             if not task:
                 continue
             status = str(task.get("status", ""))
-            if status in {"error", "removed"}:
+            if status == "removed":
                 discarded.add(gid)
                 continue
             if status != "complete":
@@ -1192,6 +1494,7 @@ def get_aria2_tasks() -> dict[str, object]:
     except Exception as exc:
         return {"ok": False, "error": str(exc), "active": [], "waiting": [], "stopped": [], "tasks": []}
     all_tasks = [*active, *waiting, *stopped]
+    record_task_failures(all_tasks)
     sync_task_retentions(all_tasks)
     result = {
         "ok": True,
@@ -1460,6 +1763,13 @@ def page(title: str, body: str) -> bytes:
     .status-warn { color: #b7791f; }
     .status-bad { color: #b4232c; }
     .recent-ip-table { font-size: 13px; }
+    .event-table { width: 100%; font-size: 13px; }
+    .event-table td { vertical-align: top; }
+    .event-time { white-space: nowrap; color: var(--muted); }
+    .event-source { white-space: nowrap; font-weight: 650; }
+    .event-message { overflow-wrap: anywhere; }
+    .event-bad { color: #b4232c; }
+    .event-warn { color: #b7791f; }
     .field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 8px; align-items: start; }
     .field-with-action textarea { height: 150px; min-height: 150px; resize: none; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--input-border) transparent; }
     .field-with-action textarea::-webkit-scrollbar { width: 8px; }
@@ -1470,6 +1780,9 @@ def page(title: str, body: str) -> bytes:
     .status-item { min-width: 0; min-height: 128px; padding: 20px 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); }
     .status-item > span { display: block; color: var(--text); font-size: 16px; font-weight: 650; }
     .status-item strong { display: block; margin-top: 14px; color: var(--primary); font-size: 30px; line-height: 1.05; overflow-wrap: anywhere; }
+    button.status-item { width: 100%; color: var(--text); text-align: left; }
+    button.status-item:hover, button.status-item:focus-visible { border-color: var(--primary); background: var(--card-bg); box-shadow: 0 0 0 2px rgba(23, 105, 170, .12); }
+    .status-subtext { margin-top: 10px; color: var(--muted) !important; font-size: 12px !important; font-weight: 600 !important; }
     .status-item .disk-bar-outer { margin-top: 18px; }
     .disk-bar-outer { height: 6px; }
     .disk-bar-inner { background: #2f855a; }
@@ -1496,9 +1809,12 @@ def page(title: str, body: str) -> bytes:
     .task-progress-row .progress { width: 100%; margin: 0; }
     .task-percent { color: var(--muted); font-size: 12px; }
     .task-complete { margin-top: 9px; padding: 8px 10px; border-left: 3px solid #2f855a; background: rgba(47, 133, 90, .1); color: #2f855a; font-size: 13px; font-weight: 700; }
+    .task-error-details { margin-top: 9px; border-left: 3px solid #b4232c; background: rgba(180, 35, 44, .08); color: #8f1d25; }
+    .task-error-details summary { padding: 8px 10px; cursor: pointer; font-size: 13px; font-weight: 700; }
+    .task-error-details p { margin: 0; padding: 0 10px 10px; overflow-wrap: anywhere; font-size: 12px; }
     .task-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 7px; color: var(--muted); font-size: 12px; }
-    .task-remove-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-top: 9px; }
-    .task-remove-form input[type=password] { min-width: 0; }
+    .task-remove-form, .task-retry-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-top: 9px; }
+    .task-remove-form input[type=password], .task-retry-form input[type=password] { min-width: 0; }
     .task-clear-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; padding-top: 12px; }
     .task-clear-form input[type=password] { min-width: 0; }
     .site-note { margin-top: 12px; padding: 0 2px; font-size: 12px; }
@@ -1635,6 +1951,24 @@ def page(title: str, body: str) -> bytes:
       var payload = await response.json();
       if (!response.ok) throw new Error(payload.error || '\u8bf7\u6c42\u5931\u8d25');
       return payload;
+    }
+    async function retryTask(form) {
+      var button = form.querySelector('button[type=submit]');
+      if (button) button.disabled = true;
+      try {
+        var payload = await postFormJson('/api/retry-task', {
+          gid: form.elements.gid.value,
+          password: form.elements.password.value
+        });
+        form.elements.password.value = '';
+        showToast(payload.message || '\u5df2\u91cd\u8bd5\u4efb\u52a1');
+        await refreshTaskPanel(true);
+      } catch (error) {
+        showToast(error.message || '\u91cd\u8bd5\u5931\u8d25');
+      } finally {
+        if (button) button.disabled = false;
+      }
+      return false;
     }
     var taskRefreshTimer = null;
     var taskRefreshBusy = false;
@@ -1946,7 +2280,10 @@ def page(title: str, body: str) -> bytes:
       }
       for (var i = 0; i < orderedRows.length; i++) {
         var name = orderedRows[i].getAttribute('data-name') || '';
-        var matchType = _curFilter === 'all' || orderedRows[i].getAttribute('data-type') === _curFilter;
+        var expiresSoon = Number(orderedRows[i].dataset.expires || 0) - Date.now() / 1000 <= 21600;
+        var matchType = _curFilter === 'all'
+          || (_curFilter === 'expiring' && expiresSoon)
+          || orderedRows[i].getAttribute('data-type') === _curFilter;
         var matchSearch = !q || name.toLowerCase().indexOf(q) >= 0;
         if (matchType && matchSearch) matches.push(orderedRows[i]);
         else orderedRows[i].style.display = 'none';
@@ -2020,6 +2357,17 @@ def page(title: str, body: str) -> bytes:
       for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
       if (selectedButton) selectedButton.classList.add('active');
       _applyFilters();
+    }
+    function focusFilePanel(type) {
+      _curFilter = type || 'all';
+      _curSearch = '';
+      _filePage = 1;
+      restoreFileViewControls();
+      _applyFilters();
+      var section = document.getElementById('available-files');
+      if (section) section.scrollIntoView({behavior: 'smooth', block: 'start'});
+      var search = document.getElementById('file-search');
+      if (search) search.focus({preventScroll: true});
     }
     function searchFiles(q) {
       _curSearch = q;
@@ -2210,7 +2558,9 @@ def page(title: str, body: str) -> bytes:
         if (!response.ok || !payload.ok) return;
         updateDiskStats(payload.stats);
         var fileCount = document.getElementById('file-count-value');
+        var expiringCount = document.getElementById('expiring-count-value');
         if (fileCount) fileCount.textContent = String(payload.file_count);
+        if (expiringCount) expiringCount.textContent = String(payload.expiring_count);
         if (!force && payload.signature === _fileSignature) return;
         if (container.contains(document.activeElement)) return;
         container.innerHTML = payload.html;
@@ -2419,6 +2769,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         '<button class="filter-btn" data-filter="document" type="button" onclick="filterFiles(\'document\', this)">\u6587\u6863</button>'
         '<button class="filter-btn" data-filter="archive" type="button" onclick="filterFiles(\'archive\', this)">\u538b\u7f29\u5305</button>'
         '<button class="filter-btn" data-filter="other" type="button" onclick="filterFiles(\'other\', this)">\u5176\u4ed6</button>'
+        '<button class="filter-btn" data-filter="expiring" type="button" onclick="filterFiles(\'expiring\', this)">\u5373\u5c06\u8fc7\u671f</button>'
         '<label class="sr-only" for="file-sort">文件排序</label>'
         '<select id="file-sort" class="file-sort" onchange="sortFiles(this.value)">'
         '<option value="name">名称排序</option>'
@@ -2534,15 +2885,30 @@ def render_task_rows(task_data: dict[str, object]) -> str:
             "removed": "已移除",
         }
         status = html.escape(status_labels.get(raw_status, raw_status))
-        progress_html = (
-            '<div class="task-complete">已完成</div>'
-            if raw_status == "complete"
-            else (
+        if raw_status == "complete":
+            progress_html = '<div class="task-complete">已完成</div>'
+        elif raw_status == "error":
+            error_text = html.escape(str(task.get("error") or "下载失败"))
+            progress_html = (
+                '<details class="task-error-details">'
+                '<summary>查看失败原因</summary>'
+                f'<p>{error_text}</p></details>'
+            )
+        else:
+            progress_html = (
                 '<div class="task-progress-row">'
                 f'<div class="progress"><div class="bar" style="width:{min(progress, 100):.1f}%"></div></div>'
                 f'<span class="task-percent">{progress:.1f}%</span></div>'
             )
-        )
+        retry_form = ""
+        if raw_status == "error" and task.get("retryable"):
+            retry_form = (
+                '<form class="task-retry-form" method="post" action="/api/retry-task" '
+                'onsubmit="retryTask(this); return false">'
+                f'<input type="hidden" name="gid" value="{gid}">'
+                '<input type="password" name="password" placeholder="管理密码" required>'
+                '<button type="submit">重试</button></form>'
+            )
         rows.append(
             '<article class="task-item">'
             '<div class="task-primary">'
@@ -2553,6 +2919,7 @@ def render_task_rows(task_data: dict[str, object]) -> str:
             f"<span>{html.escape(str(task['speed_human']))}</span>"
             f"<span>{html.escape(str(task['completed_human']))} / {html.escape(str(task['total_human']))}</span>"
             f'<span class="code">GID {gid}</span></div>'
+            f'{retry_form}'
             '<form class="task-remove-form" method="post" action="/api/remove-task">'
             f'<input type="hidden" name="gid" value="{gid}">'
             '<input type="password" name="password" placeholder="管理密码" required>'
@@ -2606,11 +2973,16 @@ def file_panel_signature(files: list[dict[str, object]]) -> str:
 def file_panel_payload(files: list[dict[str, object]] | None = None) -> dict[str, object]:
     items = scan_files() if files is None else files
     stats = get_disk_stats()
+    expiring_count = sum(
+        1 for item in items
+        if 0 < float(item.get("expires_at", 0)) - now_ts() <= 21600
+    )
     return {
         "ok": True,
         "signature": file_panel_signature(items),
         "html": render_file_rows(items, compact=True),
         "file_count": len(items),
+        "expiring_count": expiring_count,
         "stats": {
             "downloads_used_human": stats["downloads_used_human"],
             "free_human": stats["free_human"],
@@ -2667,6 +3039,8 @@ def render_admin_dashboard(message: str = "") -> bytes:
     disk = get_disk_stats()
     system = get_system_metrics()
     backup = get_backup_status()
+    maintenance = get_maintenance_status()
+    recent_events = get_recent_events()
     aria = get_aria2_tasks()
     aria_ok = bool(aria.get("ok")) if isinstance(aria, dict) else False
     task_items = aria.get("tasks", []) if isinstance(aria, dict) else []
@@ -2674,6 +3048,8 @@ def render_admin_dashboard(message: str = "") -> bytes:
     latest = backup.get("latest")
     latest_text = str(latest["created_at_text"]) if isinstance(latest, dict) else "尚未备份"
     latest_size = str(latest["size_human"]) if isinstance(latest, dict) else "-"
+    maintenance_text = str(maintenance.get("last_run_text") or "尚未运行")
+    maintenance_error = str(maintenance.get("last_error") or "")
     memory_percent = system.get("memory_percent")
     memory_display = f"{memory_percent}%" if memory_percent is not None else "不可用"
     load_average = system.get("load_average")
@@ -2706,6 +3082,21 @@ def render_admin_dashboard(message: str = "") -> bytes:
         '<table class="recent-ip-table"><thead><tr><th>登录 IP</th><th>登录时间</th></tr></thead>'
         f'<tbody>{login_rows}</tbody></table>'
         if login_rows else '<div class="empty">暂无后台登录记录</div>'
+    )
+    event_rows = []
+    for event in recent_events:
+        level = str(event.get("level", ""))
+        event_rows.append(
+            "<tr>"
+            f'<td class="event-time">{html.escape(str(event.get("time", "-")))}</td>'
+            f'<td class="event-source event-{html.escape(level)}">{html.escape(str(event.get("source", "-")))}</td>'
+            f'<td class="event-message">{html.escape(str(event.get("message", "-")))}</td>'
+            "</tr>"
+        )
+    events_html = (
+        '<table class="event-table"><thead><tr><th>时间</th><th>来源</th><th>事件</th></tr></thead>'
+        f'<tbody>{"".join(event_rows)}</tbody></table>'
+        if event_rows else '<div class="empty">暂无事件记录</div>'
     )
     body = f"""
 <header class="site-header">
@@ -2756,6 +3147,9 @@ def render_admin_dashboard(message: str = "") -> bytes:
       <div class="metric-row"><dt>最近大小</dt><dd>{html.escape(latest_size)}</dd></div>
       <div class="metric-row"><dt>保留份数</dt><dd>{int(backup["count"])} / {BACKUP_KEEP_COUNT}</dd></div>
       <div class="metric-row"><dt>备份总占用</dt><dd>{html.escape(str(backup["total_size_human"]))}</dd></div>
+      <div class="metric-row"><dt>自动维护</dt><dd>{html.escape(maintenance_text)}</dd></div>
+      <div class="metric-row"><dt>上次清理</dt><dd>{int(maintenance.get("last_removed", 0))} 个文件</dd></div>
+      {f'<div class="metric-row"><dt>维护错误</dt><dd class="status-bad">{html.escape(maintenance_error)}</dd></div>' if maintenance_error else ''}
     </dl>
     <form method="post" action="/api/admin/backup"><button type="submit">立即备份元数据</button></form>
   </section>
@@ -2766,6 +3160,10 @@ def render_admin_dashboard(message: str = "") -> bytes:
     {recent_html}
   </section>
 </div>
+<section>
+  <div class="section-heading"><div><h2>最近事件</h2><p>来自下载、上传、清理、备份和服务日志</p></div><span class="tag">最近 {len(recent_events)} 条</span></div>
+  {events_html}
+</section>
 """
     return page("管理后台", body)
 
@@ -2779,6 +3177,10 @@ def render_home(message: str = "") -> bytes:
     task_panel = task_panel_payload(tasks)
     task_summary = str(task_panel["summary"])
     task_html = str(task_panel["html"])
+    expiring_count = sum(
+        1 for item in files
+        if 0 < float(item.get("expires_at", 0)) - now_ts() <= 21600
+    )
     message_html = f'<div class="notice">{html.escape(message)}</div>' if message else ""
     body = f"""
 <header class="site-header">
@@ -2796,14 +3198,20 @@ def render_home(message: str = "") -> bytes:
 <div class="app-shell">
   <div class="file-workspace">
     <div class="status-strip">
-      <div class="status-item"><span>下载目录占用</span><strong id="downloads-used-value">{html.escape(str(stats["downloads_used_human"]))}</strong></div>
+      <button class="status-item" type="button" onclick="focusFilePanel('all')" title="查看全部文件">
+        <span>下载目录占用</span><strong id="downloads-used-value">{html.escape(str(stats["downloads_used_human"]))}</strong>
+        <span class="status-subtext">点击查看全部文件</span>
+      </button>
       <div class="status-item"><span>剩余磁盘空间</span><strong id="free-space-value">{html.escape(str(stats["free_human"]))}</strong>
         <div class="disk-bar-outer"><div id="disk-usage-bar" class="disk-bar-inner{' danger' if stats['disk_danger'] else ' warn' if stats['disk_percent'] > 80 else ''}" style="width:{stats['disk_percent']}%"></div></div>
       </div>
-      <div class="status-item"><span>文件数量</span><strong id="file-count-value">{len(files)}</strong></div>
+      <button class="status-item" type="button" onclick="focusFilePanel('expiring')" title="筛选即将过期文件">
+        <span>文件数量</span><strong id="file-count-value">{len(files)}</strong>
+        <span class="status-subtext"><span id="expiring-count-value">{expiring_count}</span> 个将在 6 小时内过期</span>
+      </button>
     </div>
     <div class="workspace-columns">
-      <section class="file-section">
+      <section id="available-files" class="file-section">
         <div class="section-heading">
           <h2>可用文件</h2>
           <div class="file-tools" aria-label="文件工具">
@@ -3001,6 +3409,49 @@ class DownloadHandler(BaseHTTPRequestHandler):
             parts.append("Secure")
         return "; ".join(parts)
 
+    def require_admin_password(self, password: str, response: str = "html") -> bool:
+        ip = self.client_ip()
+        retry_after = admin_login_retry_after(ip)
+        if retry_after:
+            message = f"管理密码尝试过多，请 {max(1, (retry_after + 59) // 60)} 分钟后重试"
+            append_log("admin-login.log", f"blocked ip={ip} path={self.normalized_path()}")
+            self.send_admin_auth_error(429, message, response, retry_after)
+            return False
+        if check_admin_password(password):
+            clear_admin_login_failures(ip)
+            return True
+        retry_after = record_admin_login_failure(ip)
+        append_log(
+            "admin-login.log",
+            f"failed ip={ip} path={self.normalized_path()} blocked={'yes' if retry_after else 'no'}",
+        )
+        if retry_after:
+            message = f"管理密码尝试过多，请 {max(1, (retry_after + 59) // 60)} 分钟后重试"
+            self.send_admin_auth_error(429, message, response, retry_after)
+        else:
+            self.send_admin_auth_error(403, "管理密码错误", response)
+        return False
+
+    def send_admin_auth_error(
+        self,
+        status: int,
+        message: str,
+        response: str,
+        retry_after: int = 0,
+    ) -> None:
+        headers = {"Retry-After": str(retry_after)} if retry_after else None
+        if response == "json":
+            self.send_bytes(
+                status,
+                json_bytes({"error": message}),
+                "application/json; charset=utf-8",
+                headers,
+            )
+        elif response == "login":
+            self.send_bytes(status, render_admin_login(message), headers=headers)
+        else:
+            self.send_bytes(status, success_page(HTTPStatus(status).phrase, message), headers=headers)
+
     def send_bytes(
         self,
         status: int,
@@ -3151,6 +3602,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_add_task(form)
         elif raw_path == "/api/remove-task":
             self.handle_remove_task(form)
+        elif raw_path == "/api/retry-task":
+            self.handle_retry_task(form)
         elif raw_path == "/api/clear-stopped":
             self.handle_clear_stopped(form)
         elif raw_path == "/api/renew":
@@ -3162,9 +3615,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
 
     def handle_admin_login(self, form: dict[str, str]) -> None:
         ip = self.client_ip()
-        if not check_admin_password(form.get("password", "")):
-            append_log("admin-login.log", f"failed ip={ip}")
-            self.send_bytes(403, render_admin_login("管理密码错误"))
+        if not self.require_admin_password(form.get("password", ""), "login"):
             return
         token = create_admin_session()
         append_log("admin-login.log", f"success ip={ip}")
@@ -3199,8 +3650,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
         self.send_redirect(f"/admin/?message={message}", 303)
 
     def handle_add_task(self, form: dict[str, str]) -> None:
-        if not check_admin_password(form.get("password", "")):
-            self.send_json(403, {"error": "管理密码错误"})
+        if not self.require_admin_password(form.get("password", ""), "json"):
             return
         try:
             urls = parse_task_urls(form.get("url", ""))
@@ -3221,6 +3671,11 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 gids.append(add_aria2_task(url, filename, retention))
             except Exception as exc:
                 errors.append(f"{url}: {exc}")
+                host = urllib.parse.urlsplit(url).hostname or "unknown"
+                append_log(
+                    "task.log",
+                    f"add_failed host={compact_log_value(host)} error={compact_log_value(exc)}",
+                )
         if not gids:
             self.send_json(400, {"error": f"添加任务失败：{errors[0]}", "added": 0, "total": len(urls)})
             return
@@ -3237,8 +3692,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
         })
 
     def handle_remove_task(self, form: dict[str, str]) -> None:
-        if not check_admin_password(form.get("password", "")):
-            self.send_error_page(403, "管理密码错误")
+        if not self.require_admin_password(form.get("password", "")):
             return
         try:
             gid = form.get("gid", "")
@@ -3249,9 +3703,19 @@ class DownloadHandler(BaseHTTPRequestHandler):
             return
         self.send_bytes(200, success_page("任务已删除", "已向 aria2 发送删除请求。"))
 
+    def handle_retry_task(self, form: dict[str, str]) -> None:
+        if not self.require_admin_password(form.get("password", ""), "json"):
+            return
+        try:
+            new_gid = retry_aria2_task(form.get("gid", ""))
+        except Exception as exc:
+            append_log("task.log", f"retry_failed gid={compact_log_value(form.get('gid'))} error={compact_log_value(exc)}")
+            self.send_json(400, {"error": f"重试失败：{exc}"})
+            return
+        self.send_json(200, {"ok": True, "message": "已重新添加下载任务", "gid": new_gid})
+
     def handle_clear_stopped(self, form: dict[str, str]) -> None:
-        if not check_admin_password(form.get("password", "")):
-            self.send_error_page(403, "管理密码错误")
+        if not self.require_admin_password(form.get("password", "")):
             return
         try:
             count = clear_stopped_tasks()
@@ -3277,8 +3741,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
         })
 
     def handle_delete_file(self, form: dict[str, str]) -> None:
-        if not check_admin_password(form.get("password", "")):
-            self.send_json(403, {"error": "管理密码错误"})
+        if not self.require_admin_password(form.get("password", ""), "json"):
             return
         filename = form.get("filename", "").strip()
         try:
@@ -3305,8 +3768,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
         })
 
     def handle_upload_init(self, form: dict[str, str]) -> None:
-        if not check_admin_password(form.get("password", "")):
-            self.send_json(403, {"error": "管理密码错误"})
+        if not self.require_admin_password(form.get("password", ""), "json"):
             return
         try:
             filename = form.get("custom_filename", "").strip() or form.get("filename", "")
@@ -3481,8 +3943,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
 
             # ---- Validate & finalise ----
             password = fields.get("password", "")
-            if not check_admin_password(password):
-                self.send_error_page(403, "管理密码错误")
+            if not self.require_admin_password(password):
                 return
             if tmp_path is None or not file_orig_name:
                 self.send_error_page(400, "请选择要上传的文件")
@@ -3848,10 +4309,23 @@ def run_server() -> None:
     get_admin_password()
     get_aria2_secret()
     cleanup_expired()
+    run_maintenance_cycle()
     server = ThreadingHTTPServer((HOST, PORT), DownloadHandler)
     print(f"Serving on http://{HOST}:{PORT}")
+    stop_event = threading.Event()
+    maintenance_thread = threading.Thread(
+        target=maintenance_worker,
+        args=(stop_event,),
+        name="maintenance-worker",
+        daemon=True,
+    )
+    maintenance_thread.start()
     with server:
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        finally:
+            stop_event.set()
+            maintenance_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

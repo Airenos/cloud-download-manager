@@ -25,6 +25,10 @@
 - 文件菜单可直接复制下载链接，剩余 6 小时/1 小时内分别使用警告/危险颜色。
 - 轻量管理后台：访问 IP、后台登录 IP、Backup 状态、存储、内存、负载、进程和 aria2 监控。
 - `/healthz` 提供不含密码和 secret 的部署健康状态。
+- 失败任务显示 aria2 错误原因，并可在任务面板输入管理密码后原地重试；重试会继承原任务的保留时间。
+- 管理密码入口按 IP 限制连续失败次数，默认 10 分钟内失败 5 次后暂停 10 分钟。
+- 服务内置轻量维护线程：默认每小时清理过期文件和上传会话，每天自动备份元数据。
+- 管理后台显示最近下载、上传、清理、备份和服务事件；首页概览卡可联动全部文件和即将过期筛选。
 
 仅用于合法资源临时中转，请勿下载或传播侵权内容。
 
@@ -143,6 +147,8 @@ cat data/admin_password.txt
 - 最近登录 IP：成功登录管理后台的 IP，记录保存在 `logs/admin-login.log`。
 - 系统监控：Linux 从 `/proc` 读取内存和当前 Python 进程 RSS；不支持的平台显示“不可用”。
 - Backup：只备份 `filemeta.json` 和 `task_retention.json`，不复制下载文件、密码或 aria2 secret，最多保留 10 份。
+- 最近事件：读取现有日志末尾，不创建数据库或常驻统计数据。
+- 自动维护：服务启动时先运行一次，随后按配置间隔清理；元数据备份达到设定间隔后自动创建。
 
 健康检查地址为 `/healthz`。aria2 不可用或磁盘低于安全阈值时返回 `status: degraded`，HTTP 服务仍返回 200，便于区分“服务存活”和“依赖降级”。
 
@@ -190,6 +196,11 @@ UPLOAD_CONCURRENCY=3
 UPLOAD_SESSION_TTL_SECONDS=21600
 UPLOAD_FALLBACK_MAX_BYTES=52428800
 ADMIN_SESSION_TTL_SECONDS=43200
+ADMIN_LOGIN_MAX_FAILURES=5
+ADMIN_LOGIN_WINDOW_SECONDS=600
+ADMIN_LOGIN_BLOCK_SECONDS=600
+MAINTENANCE_INTERVAL_SECONDS=3600
+AUTO_BACKUP_INTERVAL_SECONDS=86400
 ```
 
 说明：
@@ -203,6 +214,8 @@ ADMIN_SESSION_TTL_SECONDS=43200
 - `UPLOAD_SESSION_TTL_SECONDS` 是未完成上传的保留时间，默认 6 小时。
 - `UPLOAD_FALLBACK_MAX_BYTES` 是传统 multipart 上传上限，默认 50MiB。
 - `ADMIN_SESSION_TTL_SECONDS` 是管理后台会话期限，默认 12 小时。
+- `ADMIN_LOGIN_MAX_FAILURES`、`ADMIN_LOGIN_WINDOW_SECONDS` 和 `ADMIN_LOGIN_BLOCK_SECONDS` 控制管理密码失败限流。
+- `MAINTENANCE_INTERVAL_SECONDS` 控制自动清理周期，默认 1 小时；`AUTO_BACKUP_INTERVAL_SECONDS` 控制元数据自动备份周期，默认 1 天。
 
 ## 清理
 

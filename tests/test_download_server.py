@@ -106,6 +106,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertRegex(formatted, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertNotIn("UTC+8", formatted)
 
+    def test_log_write_failure_does_not_break_service_flow(self):
+        with mock.patch.object(Path, "open", side_effect=PermissionError("locked")):
+            self.ds.append_log("access.log", "request")
+
     def test_visitor_stats_track_active_and_recent_ips(self):
         current = 1_700_000_000.0
         with mock.patch.object(self.ds, "now_ts", return_value=current):
@@ -129,6 +133,130 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         with self.ds.zipfile.ZipFile(archive_path) as archive:
             self.assertIn("filemeta.json", archive.namelist())
             self.assertIn("manifest.json", archive.namelist())
+
+    def test_admin_login_failures_block_ip_and_success_can_clear_state(self):
+        self.ds.ADMIN_LOGIN_MAX_FAILURES = 3
+        self.ds.ADMIN_LOGIN_WINDOW_SECONDS = 600
+        self.ds.ADMIN_LOGIN_BLOCK_SECONDS = 600
+        ip = "203.0.113.20"
+
+        self.assertEqual(self.ds.record_admin_login_failure(ip, 1000), 0)
+        self.assertEqual(self.ds.record_admin_login_failure(ip, 1001), 0)
+        self.assertEqual(self.ds.record_admin_login_failure(ip, 1002), 600)
+        self.assertEqual(self.ds.admin_login_retry_after(ip, 1003), 599)
+        self.ds.clear_admin_login_failures(ip)
+        self.assertEqual(self.ds.admin_login_retry_after(ip, 1003), 0)
+
+    def test_admin_login_endpoint_returns_429_after_repeated_failures(self):
+        self.ds.ADMIN_LOGIN_MAX_FAILURES = 2
+        self.ds.ADMIN_LOGIN_BLOCK_SECONDS = 600
+        server, thread, base = self.start_test_server()
+        try:
+            for attempt in range(2):
+                request = urllib.request.Request(
+                    f"{base}/admin/login",
+                    data=urllib.parse.urlencode({"password": "wrong"}).encode("utf-8"),
+                    headers={"X-Forwarded-For": "203.0.113.21"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(error.exception.code, 403 if attempt == 0 else 429)
+            self.assertGreaterEqual(int(error.exception.headers["Retry-After"]), 1)
+            self.assertIn("管理密码尝试过多", error.exception.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_failed_task_renders_reason_and_retry_action(self):
+        normalized = self.ds.normalize_task(
+            {
+                "gid": "abc123",
+                "status": "error",
+                "errorCode": "2",
+                "errorMessage": "",
+                "totalLength": "100",
+                "completedLength": "25",
+                "files": [
+                    {
+                        "path": str(self.ds.DOWNLOADS_DIR / "archive.zip"),
+                        "uris": [{"uri": "https://example.com/archive.zip"}],
+                    }
+                ],
+            }
+        )
+
+        rendered = self.ds.render_task_rows({"ok": True, "tasks": [normalized]})
+
+        self.assertEqual(normalized["error"], "aria2 错误 2：连接超时")
+        self.assertTrue(normalized["retryable"])
+        self.assertIn("查看失败原因", rendered)
+        self.assertIn("/api/retry-task", rendered)
+        self.assertNotIn('class="progress"', rendered)
+
+    def test_retry_task_reuses_source_and_transfers_retention(self):
+        old_gid = "abc123"
+        self.ds.save_task_retentions({old_gid: 604800})
+        task = {
+            "gid": old_gid,
+            "status": "error",
+            "files": [
+                {
+                    "path": str(self.ds.DOWNLOADS_DIR / "archive.zip"),
+                    "uris": [{"uri": "https://example.com/archive.zip"}],
+                }
+            ],
+        }
+
+        def rpc(method, params=None):
+            if method == "aria2.tellStatus":
+                return task
+            if method == "aria2.addUri":
+                self.assertEqual(params[1]["out"], "archive.zip")
+                self.assertEqual(params[1]["continue"], "true")
+                return "def456"
+            if method == "aria2.removeDownloadResult":
+                return "OK"
+            raise AssertionError(method)
+
+        with (
+            mock.patch.object(self.ds, "ensure_can_add_task"),
+            mock.patch.object(self.ds, "aria2_rpc", side_effect=rpc),
+        ):
+            new_gid = self.ds.retry_aria2_task(old_gid)
+
+        self.assertEqual(new_gid, "def456")
+        self.assertEqual(self.ds.load_task_retentions(), {"def456": 604800})
+
+    def test_maintenance_cycle_cleans_files_and_creates_due_backup(self):
+        current = 1_800_000_000.0
+        target = self.ds.DOWNLOADS_DIR / "expired.txt"
+        target.write_text("expired", encoding="utf-8")
+        self.ds.save_meta({target.name: {"created_at": current - 90000}})
+
+        with mock.patch.object(self.ds, "now_ts", return_value=current):
+            state = self.ds.run_maintenance_cycle(current)
+
+        self.assertFalse(target.exists())
+        self.assertEqual(state["last_removed"], 1)
+        self.assertTrue(state["last_backup"])
+        self.assertEqual(self.ds.get_backup_status()["count"], 1)
+
+    def test_recent_events_are_sorted_and_rendered_in_admin_dashboard(self):
+        with mock.patch.object(self.ds, "now_ts", return_value=1_800_000_000.0):
+            self.ds.append_log("task.log", "failed gid=abc error=连接超时")
+        with mock.patch.object(self.ds, "now_ts", return_value=1_800_000_060.0):
+            self.ds.append_log("backup.log", "created name=metadata.zip size=100")
+
+        events = self.ds.get_recent_events()
+        with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+            dashboard = self.ds.render_admin_dashboard().decode("utf-8")
+
+        self.assertEqual(events[0]["source"], "元数据备份")
+        self.assertEqual(events[1]["level"], "bad")
+        self.assertIn("最近事件", dashboard)
+        self.assertIn("连接超时", dashboard)
 
     def test_admin_login_session_dashboard_backup_and_logout(self):
         password = self.ds.get_admin_password()
@@ -733,6 +861,27 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertNotIn('id="tasks-modal"', body)
         self.assertLess(body.index('class="file-section"'), body.index('class="task-panel"'))
         self.assertLess(body.index('<h2>可用文件</h2>'), body.index('id="open-add-task"'))
+
+    def test_home_status_card_links_to_expiring_file_filter(self):
+        target = self.ds.DOWNLOADS_DIR / "soon.txt"
+        target.write_text("soon", encoding="utf-8")
+        current = self.ds.now_ts()
+        self.ds.save_meta(
+            {
+                target.name: {
+                    "created_at": current,
+                    "retention_seconds": 3600.0,
+                }
+            }
+        )
+        with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+            body = self.ds.render_home().decode("utf-8")
+
+        self.assertIn("onclick=\"focusFilePanel('all')\"", body)
+        self.assertIn("onclick=\"focusFilePanel('expiring')\"", body)
+        self.assertIn('data-filter="expiring"', body)
+        self.assertIn('id="expiring-count-value">1</span>', body)
+        self.assertIn("_curFilter === 'expiring'", body)
 
     def test_task_panel_payload_polls_running_tasks_and_marks_completed_tasks(self):
         active = {
