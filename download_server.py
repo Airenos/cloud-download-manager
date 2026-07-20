@@ -34,11 +34,13 @@ APP_ROOT = Path(os.environ.get("APP_ROOT", Path(__file__).resolve().parent)).res
 META_LOCK = threading.RLock()
 TASK_RETENTION_LOCK = threading.RLock()
 BACKUP_LOCK = threading.RLock()
+SETTINGS_LOCK = threading.RLock()
 DOWNLOADS_DIR = (APP_ROOT / "downloads").resolve()
 LOGS_DIR = (APP_ROOT / "logs").resolve()
 DATA_DIR = (APP_ROOT / "data").resolve()
 META_PATH = DATA_DIR / "filemeta.json"
 TASK_RETENTION_PATH = DATA_DIR / "task_retention.json"
+SETTINGS_PATH = DATA_DIR / "settings.json"
 UPLOADS_DIR = (DATA_DIR / "uploads").resolve()
 BACKUPS_DIR = (DATA_DIR / "backups").resolve()
 ADMIN_PASSWORD_PATH = DATA_DIR / "admin_password.txt"
@@ -143,6 +145,45 @@ def read_or_create_secret(path: Path, length: int = 24) -> str:
     path.write_text(value + "\n", encoding="utf-8")
     chmod_600(path)
     return value
+
+
+DEFAULT_SETTINGS = {
+    "magnet_enabled": False,
+}
+
+
+def load_settings() -> dict[str, object]:
+    ensure_directories()
+    with SETTINGS_LOCK:
+        if not SETTINGS_PATH.exists():
+            return dict(DEFAULT_SETTINGS)
+        try:
+            raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return dict(DEFAULT_SETTINGS)
+        if not isinstance(raw, dict):
+            return dict(DEFAULT_SETTINGS)
+        return {
+            "magnet_enabled": bool(raw.get("magnet_enabled", DEFAULT_SETTINGS["magnet_enabled"])),
+        }
+
+
+def save_settings(settings: dict[str, object]) -> dict[str, object]:
+    ensure_directories()
+    normalized = {
+        "magnet_enabled": bool(settings.get("magnet_enabled", DEFAULT_SETTINGS["magnet_enabled"])),
+    }
+    with SETTINGS_LOCK:
+        temporary = SETTINGS_PATH.with_name(f".{SETTINGS_PATH.name}.tmp")
+        temporary.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        chmod_600(temporary)
+        temporary.replace(SETTINGS_PATH)
+        chmod_600(SETTINGS_PATH)
+    return normalized
+
+
+def magnet_download_enabled() -> bool:
+    return bool(load_settings().get("magnet_enabled", False))
 
 
 def get_admin_password() -> str:
@@ -404,7 +445,7 @@ def create_metadata_backup() -> dict[str, object]:
             "files": [],
         }
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for source in (META_PATH, TASK_RETENTION_PATH):
+            for source in (META_PATH, TASK_RETENTION_PATH, SETTINGS_PATH):
                 if source.exists() and source.is_file():
                     archive.write(source, source.name)
                     manifest["files"].append(source.name)
@@ -1100,10 +1141,28 @@ def check_admin_password(password: str) -> bool:
     return hmac.compare_digest(password or "", get_admin_password())
 
 
+MAGNET_INFO_HASH_PATTERN = re.compile(r"^urn:btih:([0-9a-f]{40}|[a-z2-7]{32})$", re.IGNORECASE)
+
+
+def validate_magnet_url(value: str) -> str:
+    if not value.lower().startswith("magnet:?"):
+        raise ValueError("磁链必须以 magnet:? 开头")
+    parsed = urllib.parse.urlsplit(value)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    info_hashes = query.get("xt", [])
+    if not any(MAGNET_INFO_HASH_PATTERN.fullmatch(item) for item in info_hashes):
+        raise ValueError("磁链必须包含有效的 BTIH 信息哈希")
+    return value
+
+
 def validate_task_url(url: str) -> str:
     value = (url or "").strip()
+    if value.lower().startswith("magnet:"):
+        if not magnet_download_enabled():
+            raise ValueError("磁链下载已关闭，请在管理后台开启后重试")
+        return validate_magnet_url(value)
     if not value.startswith(ALLOWED_URL_PREFIXES):
-        raise ValueError("只允许 http:// 或 https:// 链接")
+        raise ValueError("只允许 http:// 或 https:// 链接；磁链需先在后台开启")
     parsed = urllib.parse.urlparse(value)
     if parsed.scheme in {"file", "ftp"}:
         raise ValueError("不允许 file:// 或 ftp:// 链接")
@@ -1214,6 +1273,8 @@ def aria2_rpc(method: str, params: list[object] | None = None) -> object:
 
 def add_aria2_task(url: str, filename: str | None = None, retention_seconds: int = 0) -> str:
     validated_url = validate_task_url(url)
+    if validated_url.lower().startswith("magnet:") and filename:
+        raise ValueError("磁链任务不支持自定义文件名")
     ensure_can_add_task(validated_url)
     options = {"dir": str(DOWNLOADS_DIR)}
     out_name: str | None = None
@@ -1757,6 +1818,8 @@ def page(title: str, body: str) -> bytes:
     .metric-row:last-child { border-bottom: 0; }
     .metric-row dt { color: var(--muted); }
     .metric-row dd { margin: 0; text-align: right; font-weight: 650; overflow-wrap: anywhere; }
+    .settings-checkbox { display: flex; align-items: center; gap: 8px; margin: 0; cursor: pointer; }
+    .settings-checkbox input { width: 18px; height: 18px; accent-color: var(--primary); }
     .admin-login { width: min(100%, 440px); margin: 10vh auto 0; }
     .admin-login input[type=submit] { width: 100%; margin-top: 14px; }
     .status-good { color: #2f855a; }
@@ -1823,6 +1886,12 @@ def page(title: str, body: str) -> bytes:
     .filter-btn { background: #e8eef3; color: #29465e; border-radius: 6px; padding: 6px 10px; }
     .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
     .file-sort { width: auto; min-width: 190px; margin-left: auto; padding: 6px 30px 6px 10px; font-size: 13px; }
+    .file-bulk-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px; margin-bottom: 6px; padding: 6px 0; border-top: 1px solid var(--line); }
+    .file-select-all { display: inline-flex; align-items: center; gap: 7px; margin: 0; color: var(--muted); font-size: 13px; font-weight: 650; cursor: pointer; }
+    .file-select, .file-select-all input { width: 18px; height: 18px; margin: 0; flex: 0 0 18px; accent-color: var(--primary); cursor: pointer; }
+    .file-select { margin-top: 5px; }
+    #batch-download { min-width: 108px; padding: 7px 10px; font-size: 13px; }
+    #batch-download:disabled { opacity: .5; cursor: default; transform: none; }
     .file-table { table-layout: auto; }
     .file-table th, .file-table td { border-bottom: 0; }
     .file-table thead th { position: sticky; top: 0; z-index: 1; background: var(--card-bg); }
@@ -1904,7 +1973,7 @@ def page(title: str, body: str) -> bytes:
       .status-strip { grid-template-columns: 1fr; }
       .status-item { min-height: 112px; }
       .file-row { grid-template-columns: 1fr; }
-      .file-actions { padding-left: 42px; text-align: left; }
+      .file-actions { padding-left: 70px; text-align: left; }
       .file-action-group { justify-content: flex-start; }
       .file-sort { width: 100%; margin-left: 0; }
       .admin-dashboard-grid { grid-template-columns: 1fr; }
@@ -2018,9 +2087,13 @@ def page(title: str, body: str) -> bytes:
       var urls = document.getElementById('url');
       var filename = document.getElementById('filename');
       if (!urls || !filename) return;
-      var isBatch = taskUrlLines(urls.value).length > 1;
-      filename.disabled = isBatch;
-      filename.title = isBatch ? '\u6279\u91cf\u6dfb\u52a0\u65f6\u4e0d\u652f\u6301\u81ea\u5b9a\u4e49\u6587\u4ef6\u540d' : '';
+      var lines = taskUrlLines(urls.value);
+      var isBatch = lines.length > 1;
+      var hasMagnet = lines.some(function(line) { return line.toLowerCase().indexOf('magnet:') === 0; });
+      filename.disabled = isBatch || hasMagnet;
+      filename.title = isBatch
+        ? '\u6279\u91cf\u6dfb\u52a0\u65f6\u4e0d\u652f\u6301\u81ea\u5b9a\u4e49\u6587\u4ef6\u540d'
+        : hasMagnet ? '\u78c1\u94fe\u4efb\u52a1\u4e0d\u652f\u6301\u81ea\u5b9a\u4e49\u6587\u4ef6\u540d' : '';
     }
     async function pasteTaskUrls() {
       var input = document.getElementById('url');
@@ -2245,6 +2318,7 @@ def page(title: str, body: str) -> bytes:
     var TASK_PAGE_SIZE = 5;
     var _taskPage = 1;
     var _fileSignature = (document.getElementById('file-panel-container') || {}).dataset?.signature || '';
+    var _selectedFiles = new Set();
     function saveFileViewState() {
       try {
         sessionStorage.setItem('fileViewState', JSON.stringify({
@@ -2295,6 +2369,7 @@ def page(title: str, body: str) -> bytes:
         if (noRowsLabel) noRowsLabel.textContent = '0 / 0';
         if (noRowsPrev) noRowsPrev.disabled = true;
         if (noRowsNext) noRowsNext.disabled = true;
+        syncFileSelectionControls();
         saveFileViewState();
         return;
       }
@@ -2314,6 +2389,7 @@ def page(title: str, body: str) -> bytes:
       if (label) label.textContent = _filePage + ' / ' + totalPages;
       if (prev) prev.disabled = _filePage <= 1 || matches.length === 0;
       if (next) next.disabled = _filePage >= totalPages || matches.length === 0;
+      syncFileSelectionControls();
       saveFileViewState();
     }
     function changeFilePage(delta) {
@@ -2378,6 +2454,67 @@ def page(title: str, body: str) -> bytes:
       _fileSort = value || 'name';
       _filePage = 1;
       _applyFilters();
+    }
+    function syncFileSelectionControls() {
+      var rows = Array.prototype.slice.call(document.querySelectorAll('.file-row'));
+      var existing = new Set(rows.map(function(row) { return row.dataset.filename || ''; }));
+      _selectedFiles.forEach(function(name) { if (!existing.has(name)) _selectedFiles.delete(name); });
+      var visible = rows.filter(function(row) { return row.style.display !== 'none'; });
+      var selectedVisible = 0;
+      for (var i = 0; i < rows.length; i++) {
+        var checkbox = rows[i].querySelector('.file-select');
+        var selected = _selectedFiles.has(rows[i].dataset.filename || '');
+        if (checkbox) checkbox.checked = selected;
+        if (selected && rows[i].style.display !== 'none') selectedVisible += 1;
+      }
+      var pageSelect = document.getElementById('file-page-select');
+      if (pageSelect) {
+        pageSelect.disabled = visible.length === 0;
+        pageSelect.checked = visible.length > 0 && selectedVisible === visible.length;
+        pageSelect.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+      }
+      var count = document.getElementById('batch-download-count');
+      var button = document.getElementById('batch-download');
+      if (count) count.textContent = String(_selectedFiles.size);
+      if (button) button.disabled = _selectedFiles.size === 0;
+    }
+    function toggleFileSelection(checkbox) {
+      if (!checkbox) return;
+      var name = checkbox.value || '';
+      if (!name) return;
+      if (checkbox.checked) _selectedFiles.add(name);
+      else _selectedFiles.delete(name);
+      syncFileSelectionControls();
+    }
+    function toggleFilePageSelection(checked) {
+      var rows = document.querySelectorAll('.file-row');
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].style.display === 'none') continue;
+        var name = rows[i].dataset.filename || '';
+        if (checked && name) _selectedFiles.add(name);
+        else _selectedFiles.delete(name);
+      }
+      syncFileSelectionControls();
+    }
+    async function downloadSelectedFiles() {
+      var names = Array.from(_selectedFiles);
+      if (!names.length) return;
+      var button = document.getElementById('batch-download');
+      if (button) button.disabled = true;
+      showToast('\u5373\u5c06\u5f00\u59cb\u4e0b\u8f7d ' + names.length + ' \u4e2a\u6587\u4ef6\uff1b\u5982\u6d4f\u89c8\u5668\u63d0\u793a\uff0c\u8bf7\u5141\u8bb8\u591a\u4e2a\u4e0b\u8f7d');
+      for (var i = 0; i < names.length; i++) {
+        var link = document.createElement('a');
+        link.href = '/file/' + encodeURIComponent(names[i]);
+        link.download = names[i];
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        await delay(180);
+      }
+      _selectedFiles.clear();
+      syncFileSelectionControls();
+      showToast('\u5df2\u5f00\u59cb\u4e0b\u8f7d ' + names.length + ' \u4e2a\u6587\u4ef6');
     }
     function closeFileMenus(exceptMenu) {
       var menus = document.querySelectorAll('.file-menu');
@@ -2617,6 +2754,7 @@ def page(title: str, body: str) -> bytes:
         modal.dataset.busy = 'false';
         closeDangerConfirm();
         if (row) row.remove();
+        _selectedFiles.delete(state.filename);
         var fileCount = document.getElementById('file-count-value');
         if (fileCount) fileCount.textContent = String(document.querySelectorAll('.file-row').length);
         updateDiskStats(payload.stats);
@@ -2780,6 +2918,14 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         '</select>'
         '</div>'
     )
+    bulk_bar = (
+        '<div class="file-bulk-bar">'
+        '<label class="file-select-all"><input id="file-page-select" type="checkbox" '
+        'onchange="toggleFilePageSelection(this.checked)"> <span>本页全选</span></label>'
+        '<button id="batch-download" class="secondary" type="button" disabled '
+        'onclick="downloadSelectedFiles()">批量下载 <span id="batch-download-count">0</span></button>'
+        '</div>'
+    )
     rows = []
     for index, item in enumerate(files):
         name = str(item["name"])
@@ -2822,9 +2968,10 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         )
         rows.append(
             f'<tr class="file-row" data-type="{html.escape(ft, quote=True)}" '
-            f'data-name="{safe_name_attr}" data-index="{index}" '
+            f'data-name="{safe_name_attr}" data-filename="{safe_name_attr}" data-index="{index}" '
             f'data-created="{float(item.get("created_at", 0)):.6f}" data-expires="{float(item.get("expires_at", 0)):.6f}">'
             '<td><div class="file-row-main">'
+            f'<input class="file-select" type="checkbox" value="{safe_name_attr}" onchange="toggleFileSelection(this)" aria-label="选择 {safe_name_attr}">'
             f'<span class="file-type-icon" aria-hidden="true">{file_type_icon(ft)}</span>'
             '<div class="file-details">'
             f'<div class="file-name code">{safe_name}</div>'
@@ -2839,7 +2986,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
             "</tr>"
         )
     return (
-        filter_bar +
+        filter_bar + bulk_bar +
         '<div class="file-panel-body">'
         '<div class="file-list-scroll">'
         '<table class="file-table"><thead><tr><th>文件</th><th>操作</th></tr></thead>'
@@ -3039,6 +3186,8 @@ def render_admin_dashboard(message: str = "") -> bytes:
     disk = get_disk_stats()
     system = get_system_metrics()
     backup = get_backup_status()
+    settings = load_settings()
+    magnet_enabled = bool(settings.get("magnet_enabled", False))
     maintenance = get_maintenance_status()
     recent_events = get_recent_events()
     aria = get_aria2_tasks()
@@ -3141,7 +3290,7 @@ def render_admin_dashboard(message: str = "") -> bytes:
 </div>
 <div class="admin-dashboard-columns">
   <section>
-    <div class="section-heading"><div><h2>Backup 状态</h2><p>仅备份文件元数据和任务保留配置</p></div></div>
+    <div class="section-heading"><div><h2>Backup 状态</h2><p>备份文件元数据、任务保留配置和站点设置</p></div></div>
     <dl class="metric-list">
       <div class="metric-row"><dt>最近备份</dt><dd>{html.escape(latest_text)}</dd></div>
       <div class="metric-row"><dt>最近大小</dt><dd>{html.escape(latest_size)}</dd></div>
@@ -3161,6 +3310,14 @@ def render_admin_dashboard(message: str = "") -> bytes:
   </section>
 </div>
 <section>
+  <div class="section-heading"><div><h2>下载设置</h2><p>仅对后续添加的任务生效，不会修改已有任务。</p></div></div>
+  <form method="post" action="/api/admin/settings">
+    <label class="settings-checkbox"><input type="checkbox" name="magnet_enabled" value="1"{' checked' if magnet_enabled else ''}> 允许添加磁链下载任务</label>
+    <p class="muted">默认关闭。开启后仅接受包含有效 BTIH 信息哈希的 magnet 链接；实际可用性仍取决于 aria2 的 DHT、Tracker 和网络环境。</p>
+    <button type="submit">保存下载设置</button>
+  </form>
+</section>
+<section>
   <div class="section-heading"><div><h2>最近事件</h2><p>来自下载、上传、清理、备份和服务日志</p></div><span class="tag">最近 {len(recent_events)} 条</span></div>
   {events_html}
 </section>
@@ -3173,6 +3330,14 @@ def render_home(message: str = "") -> bytes:
     tasks = get_aria2_tasks()
     files = scan_files()
     stats = get_disk_stats()
+    settings = load_settings()
+    magnet_enabled = bool(settings.get("magnet_enabled", False))
+    magnet_state = "已开启" if magnet_enabled else "已关闭"
+    magnet_help = (
+        "可添加包含有效 BTIH 的磁链；下载是否成功取决于当前机器网络环境。"
+        if magnet_enabled else
+        "如需使用，请先由管理员在后台开启。"
+    )
     initial_file_signature = file_panel_signature(files)
     task_panel = task_panel_payload(tasks)
     task_summary = str(task_panel["summary"])
@@ -3237,6 +3402,7 @@ def render_home(message: str = "") -> bytes:
     </div>
     <div class="site-note">
       <p>文件按设定时间自动删除；一次性下载完整成功后立即删除。</p>
+      <p>磁链下载：<strong class="{'status-good' if magnet_enabled else 'muted'}">{magnet_state}</strong>。{magnet_help}</p>
       <p>仅用于合法资源临时中转。剩余空间低于 {format_size(MIN_FREE_BYTES)} 时会拒绝新任务。</p>
     </div>
   </div>
@@ -3254,7 +3420,7 @@ def render_home(message: str = "") -> bytes:
           <textarea id="url" name="url" inputmode="url" rows="5" placeholder="https://example.com/file.zip" oninput="updateTaskFilenameAvailability()" required></textarea>
           <button id="paste-task-urls" class="secondary field-action" type="button" onclick="pasteTaskUrls()" aria-label="粘贴链接" title="粘贴链接">⎘</button>
         </div>
-        <p class="muted">一次最多添加 {MAX_BATCH_TASKS} 个链接。</p>
+        <p class="muted">一次最多添加 {MAX_BATCH_TASKS} 个链接。磁链当前{magnet_state}；{magnet_help}</p>
         <label for="filename">自定义文件名（可选）</label>
         <input id="filename" name="filename" type="text" maxlength="180" placeholder="example.zip">
         {retention_select_html('task-retention')}
@@ -3592,6 +3758,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_admin_logout()
         elif raw_path == "/api/admin/backup":
             self.handle_admin_backup()
+        elif raw_path == "/api/admin/settings":
+            self.handle_admin_settings(form)
         elif raw_path == "/api/upload_init":
             self.handle_upload_init(form)
         elif raw_path == "/api/upload_finish":
@@ -3647,6 +3815,21 @@ class DownloadHandler(BaseHTTPRequestHandler):
         latest = status.get("latest")
         name = str(latest.get("name")) if isinstance(latest, dict) else "metadata"
         message = urllib.parse.quote(f"备份完成：{name}")
+        self.send_redirect(f"/admin/?message={message}", 303)
+
+    def handle_admin_settings(self, form: dict[str, str]) -> None:
+        if not self.admin_authenticated():
+            self.send_error_page(403, "管理员会话无效，请重新登录")
+            return
+        enabled = form.get("magnet_enabled", "").lower() in {"1", "true", "yes", "on"}
+        try:
+            save_settings({"magnet_enabled": enabled})
+        except OSError as exc:
+            message = urllib.parse.quote(f"保存设置失败：{exc}")
+            self.send_redirect(f"/admin/?message={message}", 303)
+            return
+        append_log("settings.log", f"magnet_enabled={'yes' if enabled else 'no'} ip={self.client_ip()}")
+        message = urllib.parse.quote(f"磁链下载已{'开启' if enabled else '关闭'}")
         self.send_redirect(f"/admin/?message={message}", 303)
 
     def handle_add_task(self, form: dict[str, str]) -> None:

@@ -123,6 +123,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
     def test_metadata_backup_keeps_status_and_manifest(self):
         self.ds.save_meta({"example.txt": {"created_at": 1_700_000_000.0}})
+        self.ds.save_settings({"magnet_enabled": True})
 
         status = self.ds.create_metadata_backup()
 
@@ -132,7 +133,45 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         archive_path = self.ds.BACKUPS_DIR / latest["name"]
         with self.ds.zipfile.ZipFile(archive_path) as archive:
             self.assertIn("filemeta.json", archive.namelist())
+            self.assertIn("settings.json", archive.namelist())
             self.assertIn("manifest.json", archive.namelist())
+
+    def test_magnet_setting_defaults_closed_and_validates_btih_hash(self):
+        valid_hex = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=test"
+        valid_base32 = "magnet:?xt=urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+        self.assertFalse(self.ds.magnet_download_enabled())
+        with self.assertRaisesRegex(ValueError, "磁链下载已关闭"):
+            self.ds.validate_task_url(valid_hex)
+
+        self.ds.save_settings({"magnet_enabled": True})
+        self.assertEqual(self.ds.validate_task_url(valid_hex), valid_hex)
+        self.assertEqual(self.ds.validate_task_url(valid_base32), valid_base32)
+        for invalid in (
+            "magnet:?dn=missing-hash",
+            "magnet:?xt=urn:btih:short",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef0123456g",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.ds.validate_task_url(invalid)
+
+    def test_magnet_task_is_sent_to_aria2_without_http_probe(self):
+        magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=test"
+        self.ds.save_settings({"magnet_enabled": True})
+
+        with (
+            mock.patch.object(self.ds, "ensure_can_add_task") as ensure_task,
+            mock.patch.object(self.ds, "aria2_rpc", return_value="abc123") as rpc,
+        ):
+            gid = self.ds.add_aria2_task(magnet, retention_seconds=604800)
+
+        self.assertEqual(gid, "abc123")
+        ensure_task.assert_called_once_with(magnet)
+        rpc.assert_called_once_with("aria2.addUri", [[magnet], {"dir": str(self.ds.DOWNLOADS_DIR)}])
+        self.assertEqual(self.ds.load_task_retentions(), {"abc123": 604800})
+        with self.assertRaisesRegex(ValueError, "不支持自定义文件名"):
+            self.ds.add_aria2_task(magnet, filename="custom.bin")
 
     def test_admin_login_failures_block_ip_and_success_can_clear_state(self):
         self.ds.ADMIN_LOGIN_MAX_FAILURES = 3
@@ -269,6 +308,15 @@ class DownloadServerBehaviorTests(unittest.TestCase):
                 urllib.request.urlopen(unauthorized_backup, timeout=3)
             self.assertEqual(unauthorized_error.exception.code, 403)
 
+            unauthorized_settings = urllib.request.Request(
+                f"{base}/api/admin/settings",
+                data=urllib.parse.urlencode({"magnet_enabled": "1"}).encode("utf-8"),
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as unauthorized_settings_error:
+                urllib.request.urlopen(unauthorized_settings, timeout=3)
+            self.assertEqual(unauthorized_settings_error.exception.code, 403)
+
             with opener.open(f"{base}/admin/", timeout=3) as response:
                 login_page = response.read().decode("utf-8")
             self.assertIn("管理员登录", login_page)
@@ -286,7 +334,18 @@ class DownloadServerBehaviorTests(unittest.TestCase):
                     dashboard = response.read().decode("utf-8")
             self.assertIn("系统监控", dashboard)
             self.assertIn("Backup 状态", dashboard)
+            self.assertIn("下载设置", dashboard)
             self.assertIn("203.0.113.5", dashboard)
+
+            settings_request = urllib.request.Request(
+                f"{base}/api/admin/settings",
+                data=urllib.parse.urlencode({"magnet_enabled": "1"}).encode("utf-8"),
+                method="POST",
+            )
+            with opener.open(settings_request, timeout=3) as response:
+                settings_page = response.read().decode("utf-8")
+            self.assertIn("磁链下载已开启", settings_page)
+            self.assertTrue(self.ds.magnet_download_enabled())
 
             backup_request = urllib.request.Request(f"{base}/api/admin/backup", data=b"", method="POST")
             with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
@@ -748,6 +807,9 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('class="menu-command danger-text delete-file-btn"', body)
         self.assertIn('onclick="deleteFile(this)"', body)
         self.assertIn('data-filename="clip.mp4"', body)
+        self.assertIn('class="file-select"', body)
+        self.assertIn('id="file-page-select"', body)
+        self.assertIn('id="batch-download"', body)
         self.assertNotIn('name="password"', body)
         self.assertIn('aria-expanded="false"', body)
         self.assertIn('id="filter-empty"', body)
@@ -882,6 +944,17 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('data-filter="expiring"', body)
         self.assertIn('id="expiring-count-value">1</span>', body)
         self.assertIn("_curFilter === 'expiring'", body)
+
+    def test_home_shows_current_magnet_setting_and_guidance(self):
+        with mock.patch.object(self.ds, "get_aria2_tasks", return_value={"ok": True, "tasks": []}):
+            disabled = self.ds.render_home().decode("utf-8")
+            self.ds.save_settings({"magnet_enabled": True})
+            enabled = self.ds.render_home().decode("utf-8")
+
+        self.assertIn("磁链下载：", disabled)
+        self.assertIn("磁链当前已关闭", disabled)
+        self.assertIn("磁链当前已开启", enabled)
+        self.assertIn("有效 BTIH", enabled)
 
     def test_task_panel_payload_polls_running_tasks_and_marks_completed_tasks(self):
         active = {
@@ -1116,6 +1189,8 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "id=\"downloads-used-value\"",
             "id=\"disk-usage-bar\"",
             "function sortFiles",
+            "function downloadSelectedFiles",
+            "toggleFilePageSelection",
             "if (resetPage) _taskPage = 1",
             "body.contains(document.activeElement)",
             "await refreshTaskPanel(true)",
