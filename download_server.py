@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import sys
+import tempfile
 import time
 import traceback
 import urllib.parse
@@ -35,6 +36,7 @@ META_LOCK = threading.RLock()
 TASK_RETENTION_LOCK = threading.RLock()
 BACKUP_LOCK = threading.RLock()
 SETTINGS_LOCK = threading.RLock()
+BATCH_ARCHIVE_LOCK = threading.Lock()
 DOWNLOADS_DIR = (APP_ROOT / "downloads").resolve()
 LOGS_DIR = (APP_ROOT / "logs").resolve()
 DATA_DIR = (APP_ROOT / "data").resolve()
@@ -56,6 +58,9 @@ RETENTION_SECONDS = int(RETENTION_HOURS * 3600)
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(2 * 1024**3)))
 MAX_DOWNLOAD_DIR_BYTES = int(os.environ.get("MAX_DOWNLOAD_DIR_BYTES", str(12 * 1024**3)))
 SINGLE_FILE_LIMIT_BYTES = int(os.environ.get("SINGLE_FILE_LIMIT_BYTES", str(4 * 1024**3)))
+MAX_BATCH_ARCHIVE_BYTES = int(
+    os.environ.get("MAX_BATCH_ARCHIVE_BYTES", str(SINGLE_FILE_LIMIT_BYTES))
+)
 UPLOAD_CHUNK_BYTES = int(os.environ.get("UPLOAD_CHUNK_BYTES", str(5 * 1024**2)))
 UPLOAD_CONCURRENCY = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
 UPLOAD_SESSION_TTL_SECONDS = int(os.environ.get("UPLOAD_SESSION_TTL_SECONDS", "21600"))
@@ -111,6 +116,8 @@ RETENTION_OPTIONS = [
 ]
 RETENTION_OPTIONS_SET = {v for v, _ in RETENTION_OPTIONS}
 MAX_BATCH_TASKS = 20
+MAX_BATCH_FILES = 50
+BATCH_ARCHIVE_RESERVE_BYTES = 64 * 1024**2
 BANNED_PREFIXES = (
     "/.git",
     "/logs",
@@ -1055,6 +1062,12 @@ def cleanup_expired() -> list[str]:
                     f.unlink()
             except OSError:
                 pass
+        for archive in DATA_DIR.glob(".batch-archive-*.zip"):
+            try:
+                if now - archive.stat().st_mtime > 3600:
+                    archive.unlink()
+            except OSError:
+                pass
         if changed:
             save_meta(meta)
     return removed
@@ -1087,6 +1100,90 @@ def delete_file(filename: str) -> None:
             meta.pop(filename, None)
             save_meta(meta)
     append_log("delete.log", f"deleted name={filename}")
+
+
+def parse_batch_filenames(value: str) -> list[str]:
+    try:
+        raw = json.loads(value or "")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("批量文件列表格式无效") from exc
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("请至少选择一个文件")
+    if len(raw) > MAX_BATCH_FILES:
+        raise ValueError(f"一次最多操作 {MAX_BATCH_FILES} 个文件")
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise ValueError("批量文件列表包含无效文件名")
+        name = decode_path_segment(item)
+        if name in seen:
+            continue
+        safe_download_path(name)
+        seen.add(name)
+        names.append(name)
+    if not names:
+        raise ValueError("请至少选择一个文件")
+    return names
+
+
+def delete_files(filenames: list[str]) -> int:
+    paths = [safe_download_path(name) for name in filenames]
+    deleted_names: list[str] = []
+    try:
+        for path in paths:
+            path.unlink()
+            deleted_names.append(path.name)
+    finally:
+        if deleted_names:
+            with META_LOCK:
+                meta = load_meta()
+                for name in deleted_names:
+                    meta.pop(name, None)
+                save_meta(meta)
+            append_log("delete.log", f"batch_deleted count={len(deleted_names)}")
+    return len(deleted_names)
+
+
+def create_batch_archive(filenames: list[str]) -> tuple[Path, str]:
+    ensure_directories()
+    paths = [safe_download_path(name) for name in filenames]
+    total_size = sum(path.stat().st_size for path in paths)
+    if total_size > MAX_BATCH_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"所选文件总大小超过打包限制 {format_size(MAX_BATCH_ARCHIVE_BYTES)}"
+        )
+    free = shutil.disk_usage(DATA_DIR).free
+    if total_size + BATCH_ARCHIVE_RESERVE_BYTES > free:
+        raise RuntimeError(
+            f"剩余空间不足，打包需要预留约 {format_size(total_size + BATCH_ARCHIVE_RESERVE_BYTES)}"
+        )
+    temporary = tempfile.NamedTemporaryFile(
+        prefix=".batch-archive-",
+        suffix=".zip",
+        dir=DATA_DIR,
+        delete=False,
+    )
+    archive_path = Path(temporary.name)
+    temporary.close()
+    try:
+        with zipfile.ZipFile(
+            archive_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+            allowZip64=True,
+        ) as archive:
+            for path in paths:
+                archive.write(path, path.name)
+        chmod_600(archive_path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            archive_path.unlink()
+        raise
+    download_name = f"临时文件-{datetime.now(TIMEZONE_CN).strftime('%Y%m%d-%H%M%S')}.zip"
+    append_log("download.log", f"batch_archive created count={len(paths)} size={archive_path.stat().st_size}")
+    return archive_path, download_name
 
 
 def validate_custom_filename(filename: str) -> str:
@@ -1863,6 +1960,8 @@ def page(title: str, body: str) -> bytes:
     .file-tools { display: flex; align-items: center; gap: 7px; }
     .file-tool-button { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; background: var(--primary); color: #fff; }
     .file-tool-button:hover, .file-tool-button[aria-expanded="true"] { background: var(--primary-dark); color: #fff; }
+    .file-select-mode-toggle { min-width: 76px; height: 42px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+    .file-select-mode-toggle[aria-pressed="true"] { background: var(--primary); color: #fff; }
     .task-list { flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--line); }
     .task-item { padding: 12px 0; border-bottom: 1px solid var(--line); }
     .task-primary { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
@@ -1886,12 +1985,20 @@ def page(title: str, body: str) -> bytes:
     .filter-btn { background: #e8eef3; color: #29465e; border-radius: 6px; padding: 6px 10px; }
     .filter-btn.active, .filter-btn:hover { background: var(--primary); color: #fff; }
     .file-sort { width: auto; min-width: 190px; margin-left: auto; padding: 6px 30px 6px 10px; font-size: 13px; }
-    .file-bulk-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px; margin-bottom: 6px; padding: 6px 0; border-top: 1px solid var(--line); }
+    .file-bulk-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 50px; margin-bottom: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--file-bg); }
+    .file-bulk-bar[hidden] { display: none; }
+    .file-bulk-summary { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .file-selected-count { color: var(--text); font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .file-bulk-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+    .file-bulk-actions button { min-width: 72px; padding: 7px 10px; font-size: 13px; }
+    .file-bulk-actions button:disabled { opacity: .5; cursor: default; transform: none; }
     .file-select-all { display: inline-flex; align-items: center; gap: 7px; margin: 0; color: var(--muted); font-size: 13px; font-weight: 650; cursor: pointer; }
     .file-select, .file-select-all input { width: 18px; height: 18px; margin: 0; flex: 0 0 18px; accent-color: var(--primary); cursor: pointer; }
     .file-select { margin-top: 5px; }
-    #batch-download { min-width: 108px; padding: 7px 10px; font-size: 13px; }
-    #batch-download:disabled { opacity: .5; cursor: default; transform: none; }
+    .file-section:not(.selection-mode) .file-select { display: none; }
+    .file-section.selection-mode .file-row { cursor: pointer; }
+    .file-section.selection-mode .file-row.selected { background: rgba(23, 105, 170, .08); }
+    .file-section.selection-mode .file-actions { visibility: hidden; pointer-events: none; }
     .file-table { table-layout: auto; }
     .file-table th, .file-table td { border-bottom: 0; }
     .file-table thead th { position: sticky; top: 0; z-index: 1; background: var(--card-bg); }
@@ -1973,9 +2080,16 @@ def page(title: str, body: str) -> bytes:
       .status-strip { grid-template-columns: 1fr; }
       .status-item { min-height: 112px; }
       .file-row { grid-template-columns: 1fr; }
-      .file-actions { padding-left: 70px; text-align: left; }
+      .file-actions { padding-left: 42px; text-align: left; }
+      .file-section.selection-mode .file-actions { padding-left: 70px; }
       .file-action-group { justify-content: flex-start; }
       .file-sort { width: 100%; margin-left: 0; }
+      .file-bulk-bar { align-items: stretch; flex-direction: column; }
+      .file-bulk-summary { justify-content: space-between; }
+      .file-bulk-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .file-bulk-actions button { min-width: 0; }
+      .file-select-mode-toggle { min-width: 42px; width: 42px; padding: 0; }
+      .file-select-mode-toggle .file-select-mode-text { display: none; }
       .admin-dashboard-grid { grid-template-columns: 1fr; }
     }
     """
@@ -2319,6 +2433,7 @@ def page(title: str, body: str) -> bytes:
     var _taskPage = 1;
     var _fileSignature = (document.getElementById('file-panel-container') || {}).dataset?.signature || '';
     var _selectedFiles = new Set();
+    var _fileSelectionMode = false;
     function saveFileViewState() {
       try {
         sessionStorage.setItem('fileViewState', JSON.stringify({
@@ -2455,6 +2570,21 @@ def page(title: str, body: str) -> bytes:
       _filePage = 1;
       _applyFilters();
     }
+    function setFileSelectionMode(enabled) {
+      _fileSelectionMode = !!enabled;
+      var section = document.getElementById('available-files');
+      var toggle = document.getElementById('toggle-file-selection');
+      var label = document.getElementById('file-select-mode-label');
+      if (section) section.classList.toggle('selection-mode', _fileSelectionMode);
+      if (toggle) toggle.setAttribute('aria-pressed', _fileSelectionMode ? 'true' : 'false');
+      if (label) label.textContent = _fileSelectionMode ? '\u5b8c\u6210' : '\u591a\u9009';
+      if (!_fileSelectionMode) _selectedFiles.clear();
+      closeFileMenus();
+      syncFileSelectionControls();
+    }
+    function toggleFileSelectionMode() {
+      setFileSelectionMode(!_fileSelectionMode);
+    }
     function syncFileSelectionControls() {
       var rows = Array.prototype.slice.call(document.querySelectorAll('.file-row'));
       var existing = new Set(rows.map(function(row) { return row.dataset.filename || ''; }));
@@ -2465,34 +2595,55 @@ def page(title: str, body: str) -> bytes:
         var checkbox = rows[i].querySelector('.file-select');
         var selected = _selectedFiles.has(rows[i].dataset.filename || '');
         if (checkbox) checkbox.checked = selected;
+        rows[i].classList.toggle('selected', _fileSelectionMode && selected);
         if (selected && rows[i].style.display !== 'none') selectedVisible += 1;
       }
+      var bulkBar = document.getElementById('file-bulk-bar');
+      if (bulkBar) bulkBar.hidden = !_fileSelectionMode;
       var pageSelect = document.getElementById('file-page-select');
       if (pageSelect) {
-        pageSelect.disabled = visible.length === 0;
+        pageSelect.disabled = !_fileSelectionMode || visible.length === 0;
         pageSelect.checked = visible.length > 0 && selectedVisible === visible.length;
         pageSelect.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
       }
-      var count = document.getElementById('batch-download-count');
-      var button = document.getElementById('batch-download');
+      var count = document.getElementById('batch-selected-count');
       if (count) count.textContent = String(_selectedFiles.size);
-      if (button) button.disabled = _selectedFiles.size === 0;
+      var actionButtons = document.querySelectorAll('[data-batch-file-action]');
+      for (var actionIndex = 0; actionIndex < actionButtons.length; actionIndex++) {
+        actionButtons[actionIndex].disabled = _selectedFiles.size === 0;
+      }
     }
     function toggleFileSelection(checkbox) {
       if (!checkbox) return;
       var name = checkbox.value || '';
       if (!name) return;
+      if (checkbox.checked && !_selectedFiles.has(name) && _selectedFiles.size >= 50) {
+        checkbox.checked = false;
+        showToast('\u4e00\u6b21\u6700\u591a\u9009\u62e9 50 \u4e2a\u6587\u4ef6');
+        return;
+      }
       if (checkbox.checked) _selectedFiles.add(name);
       else _selectedFiles.delete(name);
       syncFileSelectionControls();
+    }
+    function toggleFileRow(event, row) {
+      if (!_fileSelectionMode || !row) return;
+      if (event.target.closest('input, button, a, select, label')) return;
+      var checkbox = row.querySelector('.file-select');
+      if (!checkbox) return;
+      checkbox.checked = !checkbox.checked;
+      toggleFileSelection(checkbox);
     }
     function toggleFilePageSelection(checked) {
       var rows = document.querySelectorAll('.file-row');
       for (var i = 0; i < rows.length; i++) {
         if (rows[i].style.display === 'none') continue;
         var name = rows[i].dataset.filename || '';
-        if (checked && name) _selectedFiles.add(name);
-        else _selectedFiles.delete(name);
+        if (checked && name) {
+          if (_selectedFiles.has(name) || _selectedFiles.size < 50) _selectedFiles.add(name);
+        } else {
+          _selectedFiles.delete(name);
+        }
       }
       syncFileSelectionControls();
     }
@@ -2512,9 +2663,50 @@ def page(title: str, body: str) -> bytes:
         link.remove();
         await delay(180);
       }
-      _selectedFiles.clear();
-      syncFileSelectionControls();
+      setFileSelectionMode(false);
       showToast('\u5df2\u5f00\u59cb\u4e0b\u8f7d ' + names.length + ' \u4e2a\u6587\u4ef6');
+    }
+    function archiveSelectedFiles() {
+      var names = Array.from(_selectedFiles);
+      if (!names.length) return;
+      var form = document.createElement('form');
+      var input = document.createElement('input');
+      var frame = document.createElement('iframe');
+      var frameName = 'batch-archive-' + Date.now();
+      frame.name = frameName;
+      frame.hidden = true;
+      frame.addEventListener('load', function() {
+        try {
+          var message = frame.contentDocument && frame.contentDocument.querySelector('main section > p');
+          if (message && message.textContent.trim()) showToast(message.textContent.trim());
+        } catch (error) {}
+      });
+      form.method = 'post';
+      form.action = '/api/archive-files';
+      form.target = frameName;
+      form.hidden = true;
+      input.type = 'hidden';
+      input.name = 'filenames';
+      input.value = JSON.stringify(names);
+      form.appendChild(input);
+      document.body.appendChild(frame);
+      document.body.appendChild(form);
+      form.submit();
+      window.setTimeout(function() { form.remove(); frame.remove(); }, 60000);
+      setFileSelectionMode(false);
+      showToast('\u6b63\u5728\u6253\u5305 ' + names.length + ' \u4e2a\u6587\u4ef6\uff0c\u5b8c\u6210\u540e\u4f1a\u81ea\u52a8\u4e0b\u8f7d');
+    }
+    function deleteSelectedFiles(button) {
+      var names = Array.from(_selectedFiles);
+      if (!names.length) return;
+      openDangerConfirm({
+        mode: 'batch-delete',
+        title: '\u6279\u91cf\u5220\u9664',
+        message: '\u786e\u5b9a\u5220\u9664\u5df2\u9009\u7684 ' + names.length + ' \u4e2a\u6587\u4ef6\u5417\uff1f\u6b64\u64cd\u4f5c\u65e0\u6cd5\u64a4\u9500\u3002',
+        confirmLabel: '\u5220\u9664 ' + names.length + ' \u4e2a\u6587\u4ef6',
+        requiresPassword: true,
+        filenames: names
+      }, button);
     }
     function closeFileMenus(exceptMenu) {
       var menus = document.querySelectorAll('.file-menu');
@@ -2696,8 +2888,11 @@ def page(title: str, body: str) -> bytes:
         updateDiskStats(payload.stats);
         var fileCount = document.getElementById('file-count-value');
         var expiringCount = document.getElementById('expiring-count-value');
+        var selectionToggle = document.getElementById('toggle-file-selection');
         if (fileCount) fileCount.textContent = String(payload.file_count);
         if (expiringCount) expiringCount.textContent = String(payload.expiring_count);
+        if (selectionToggle) selectionToggle.disabled = payload.file_count === 0;
+        if (payload.file_count === 0 && _fileSelectionMode) setFileSelectionMode(false);
         if (!force && payload.signature === _fileSignature) return;
         if (container.contains(document.activeElement)) return;
         container.innerHTML = payload.html;
@@ -2749,6 +2944,19 @@ def page(title: str, body: str) -> bytes:
       modal.dataset.busy = 'true';
       submit.disabled = true;
       try {
+        if (state.mode === 'batch-delete') {
+          var batchPayload = await postFormJson('/api/delete-files', {
+            filenames: JSON.stringify(state.filenames || []),
+            password: password.value
+          });
+          modal.dataset.busy = 'false';
+          closeDangerConfirm();
+          setFileSelectionMode(false);
+          updateDiskStats(batchPayload.stats);
+          await refreshFilePanel(true);
+          showToast(batchPayload.message || '\u5df2\u5220\u9664\u6240\u9009\u6587\u4ef6');
+          return;
+        }
         var payload = await postFormJson('/api/delete-file', {filename: state.filename, password: password.value});
         var row = state.button && state.button.closest('.file-row');
         modal.dataset.busy = 'false';
@@ -2919,11 +3127,21 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         '</div>'
     )
     bulk_bar = (
-        '<div class="file-bulk-bar">'
+        '<div id="file-bulk-bar" class="file-bulk-bar" hidden>'
+        '<div class="file-bulk-summary">'
         '<label class="file-select-all"><input id="file-page-select" type="checkbox" '
         'onchange="toggleFilePageSelection(this.checked)"> <span>本页全选</span></label>'
-        '<button id="batch-download" class="secondary" type="button" disabled '
-        'onclick="downloadSelectedFiles()">批量下载 <span id="batch-download-count">0</span></button>'
+        '<span class="file-selected-count">已选 <span id="batch-selected-count">0</span> 个</span>'
+        '</div>'
+        '<div class="file-bulk-actions">'
+        '<button id="batch-download" class="secondary" type="button" data-batch-file-action disabled '
+        'onclick="downloadSelectedFiles()">下载</button>'
+        '<button id="batch-archive" class="secondary" type="button" data-batch-file-action disabled '
+        'onclick="archiveSelectedFiles()">打包 ZIP</button>'
+        '<button id="batch-delete" class="danger" type="button" data-batch-file-action disabled '
+        'onclick="deleteSelectedFiles(this)">删除</button>'
+        '<button class="secondary" type="button" onclick="setFileSelectionMode(false)">取消</button>'
+        '</div>'
         '</div>'
     )
     rows = []
@@ -2969,7 +3187,8 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         rows.append(
             f'<tr class="file-row" data-type="{html.escape(ft, quote=True)}" '
             f'data-name="{safe_name_attr}" data-filename="{safe_name_attr}" data-index="{index}" '
-            f'data-created="{float(item.get("created_at", 0)):.6f}" data-expires="{float(item.get("expires_at", 0)):.6f}">'
+            f'data-created="{float(item.get("created_at", 0)):.6f}" data-expires="{float(item.get("expires_at", 0)):.6f}" '
+            'onclick="toggleFileRow(event, this)">'
             '<td><div class="file-row-main">'
             f'<input class="file-select" type="checkbox" value="{safe_name_attr}" onchange="toggleFileSelection(this)" aria-label="选择 {safe_name_attr}">'
             f'<span class="file-type-icon" aria-hidden="true">{file_type_icon(ft)}</span>'
@@ -3380,6 +3599,10 @@ def render_home(message: str = "") -> bytes:
         <div class="section-heading">
           <h2>可用文件</h2>
           <div class="file-tools" aria-label="文件工具">
+            <button id="toggle-file-selection" class="file-select-mode-toggle secondary" type="button"
+                    onclick="toggleFileSelectionMode()" aria-pressed="false" aria-label="多选文件" title="多选文件"{' disabled' if not files else ''}>
+              <span aria-hidden="true">✓</span><span id="file-select-mode-label" class="file-select-mode-text">多选</span>
+            </button>
             <button id="open-add-task" class="file-tool-button" type="button" data-admin-modal="add-task-modal"
                     aria-controls="add-task-modal" aria-expanded="false" aria-label="添加链接" title="添加链接">
               <span class="admin-tool-icon" aria-hidden="true">+</span>
@@ -3778,6 +4001,10 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_renew(form)
         elif raw_path == "/api/delete-file":
             self.handle_delete_file(form)
+        elif raw_path == "/api/delete-files":
+            self.handle_delete_files(form)
+        elif raw_path == "/api/archive-files":
+            self.handle_archive_files(form)
         else:
             self.send_error_page(404, "接口不存在")
 
@@ -3949,6 +4176,84 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 "disk_danger": stats["disk_danger"],
             },
         })
+
+    def handle_delete_files(self, form: dict[str, str]) -> None:
+        if not self.require_admin_password(form.get("password", ""), "json"):
+            return
+        try:
+            filenames = parse_batch_filenames(form.get("filenames", ""))
+            deleted = delete_files(filenames)
+        except FileNotFoundError:
+            self.send_json(404, {"error": "部分文件不存在或已删除，请刷新后重试"})
+            return
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self.send_json(500, {"error": f"批量删除失败：{exc}"})
+            return
+        stats = get_disk_stats()
+        self.send_json(200, {
+            "ok": True,
+            "message": f"已删除 {deleted} 个文件",
+            "deleted": deleted,
+            "stats": {
+                "downloads_used_human": stats["downloads_used_human"],
+                "free_human": stats["free_human"],
+                "disk_percent": stats["disk_percent"],
+                "disk_danger": stats["disk_danger"],
+            },
+        })
+
+    def handle_archive_files(self, form: dict[str, str]) -> None:
+        if not BATCH_ARCHIVE_LOCK.acquire(blocking=False):
+            self.send_error_page(409, "已有打包任务正在进行，请稍后重试")
+            return
+        try:
+            self._handle_archive_files(form)
+        finally:
+            BATCH_ARCHIVE_LOCK.release()
+
+    def _handle_archive_files(self, form: dict[str, str]) -> None:
+        archive_path: Path | None = None
+        try:
+            filenames = parse_batch_filenames(form.get("filenames", ""))
+            archive_path, download_name = create_batch_archive(filenames)
+        except FileNotFoundError:
+            self.send_error_page(404, "部分文件不存在或已删除，请刷新后重试")
+            return
+        except ValueError as exc:
+            self.send_error_page(400, str(exc))
+            return
+        except RuntimeError as exc:
+            self.send_error_page(507, str(exc))
+            return
+        except (OSError, zipfile.BadZipFile) as exc:
+            self.send_error_page(500, f"打包失败：{exc}")
+            return
+
+        completed = False
+        try:
+            stat = archive_path.stat()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", content_disposition(download_name))
+            self.send_header("Content-Length", str(stat.st_size))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            with archive_path.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile)
+            completed = True
+        except (BrokenPipeError, ConnectionError, OSError):
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                archive_path.unlink()
+        if completed:
+            for filename in filenames:
+                increment_download_count(filename)
+            append_log("download.log", f"batch_archive completed count={len(filenames)}")
 
     def handle_upload_init(self, form: dict[str, str]) -> None:
         if not self.require_admin_password(form.get("password", ""), "json"):

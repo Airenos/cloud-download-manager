@@ -1,6 +1,7 @@
 import contextlib
 import http.cookiejar
 import importlib
+import io
 import json
 import os
 import shutil
@@ -172,6 +173,33 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertEqual(self.ds.load_task_retentions(), {"abc123": 604800})
         with self.assertRaisesRegex(ValueError, "不支持自定义文件名"):
             self.ds.add_aria2_task(magnet, filename="custom.bin")
+
+    def test_batch_archive_validates_files_and_builds_private_zip(self):
+        first = self.ds.DOWNLOADS_DIR / "第一份.txt"
+        second = self.ds.DOWNLOADS_DIR / "second.bin"
+        first.write_text("hello", encoding="utf-8")
+        second.write_bytes(b"world")
+
+        names = self.ds.parse_batch_filenames(json.dumps([first.name, second.name, first.name]))
+        self.assertEqual(names, [first.name, second.name])
+        archive_path, download_name = self.ds.create_batch_archive(names)
+        try:
+            self.assertEqual(archive_path.parent, self.ds.DATA_DIR)
+            self.assertTrue(archive_path.name.startswith(".batch-archive-"))
+            self.assertTrue(download_name.endswith(".zip"))
+            with self.ds.zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(set(archive.namelist()), {first.name, second.name})
+                self.assertEqual(archive.read(first.name), b"hello")
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+        for invalid in ("", "{}", json.dumps(["../secret.txt"]), json.dumps(["missing.txt"])):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    self.ds.parse_batch_filenames(invalid)
+        with mock.patch.object(self.ds, "MAX_BATCH_ARCHIVE_BYTES", 1):
+            with self.assertRaisesRegex(RuntimeError, "总大小超过打包限制"):
+                self.ds.create_batch_archive([first.name])
 
     def test_admin_login_failures_block_ip_and_success_can_clear_state(self):
         self.ds.ADMIN_LOGIN_MAX_FAILURES = 3
@@ -810,6 +838,9 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('class="file-select"', body)
         self.assertIn('id="file-page-select"', body)
         self.assertIn('id="batch-download"', body)
+        self.assertIn('id="batch-archive"', body)
+        self.assertIn('id="batch-delete"', body)
+        self.assertIn('id="file-bulk-bar" class="file-bulk-bar" hidden', body)
         self.assertNotIn('name="password"', body)
         self.assertIn('aria-expanded="false"', body)
         self.assertIn('id="filter-empty"', body)
@@ -1132,8 +1163,88 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_batch_delete_requires_password_and_removes_selected_files(self):
+        first = self.ds.DOWNLOADS_DIR / "delete-a.txt"
+        second = self.ds.DOWNLOADS_DIR / "delete-b.txt"
+        first.write_text("a", encoding="utf-8")
+        second.write_text("b", encoding="utf-8")
+        self.ds.save_meta({
+            first.name: {"created_at": self.ds.now_ts()},
+            second.name: {"created_at": self.ds.now_ts()},
+        })
+        filenames = json.dumps([first.name, second.name])
+        password = self.ds.get_admin_password()
+        server, thread, base = self.start_test_server()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_form_json(
+                    base,
+                    "/api/delete-files",
+                    {"filenames": filenames, "password": "wrong"},
+                )
+            self.assertEqual(error.exception.code, 403)
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
+
+            status, payload = self.post_form_json(
+                base,
+                "/api/delete-files",
+                {"filenames": filenames, "password": password},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["deleted"], 2)
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertEqual(self.ds.load_meta(), {})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_batch_archive_streams_zip_cleans_temp_and_counts_downloads(self):
+        first = self.ds.DOWNLOADS_DIR / "archive-a.txt"
+        second = self.ds.DOWNLOADS_DIR / "archive-b.txt"
+        first.write_text("alpha", encoding="utf-8")
+        second.write_text("beta", encoding="utf-8")
+        self.ds.save_meta({
+            first.name: {"created_at": self.ds.now_ts(), "download_count": 0.0},
+            second.name: {"created_at": self.ds.now_ts(), "download_count": 2.0},
+        })
+        server, thread, base = self.start_test_server()
+        try:
+            request = urllib.request.Request(
+                f"{base}/api/archive-files",
+                data=urllib.parse.urlencode({
+                    "filenames": json.dumps([first.name, second.name]),
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get_content_type(), "application/zip")
+                self.assertIn(".zip", response.headers["Content-Disposition"])
+            with self.ds.zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                self.assertEqual(set(archive.namelist()), {first.name, second.name})
+                self.assertEqual(archive.read(first.name), b"alpha")
+            self.assertEqual(list(self.ds.DATA_DIR.glob(".batch-archive-*.zip")), [])
+            for _ in range(50):
+                if self.ds.load_meta()[first.name].get("download_count") == 1.0:
+                    break
+                self.ds.time.sleep(0.01)
+            self.assertEqual(self.ds.load_meta()[first.name]["download_count"], 1.0)
+            self.assertEqual(self.ds.load_meta()[second.name]["download_count"], 3.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_page_includes_responsive_workspace_modals_and_file_menu(self):
         body = self.ds.render_home().decode("utf-8")
+
+        self.assertIn('id="toggle-file-selection"', body)
+        self.assertIn('aria-pressed="false"', body)
 
         for css_or_script in (
             ".workspace-columns",
@@ -1189,8 +1300,13 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "id=\"downloads-used-value\"",
             "id=\"disk-usage-bar\"",
             "function sortFiles",
+            "function toggleFileSelectionMode",
             "function downloadSelectedFiles",
+            "function archiveSelectedFiles",
+            "function deleteSelectedFiles",
             "toggleFilePageSelection",
+            "'/api/archive-files'",
+            "'/api/delete-files'",
             "if (resetPage) _taskPage = 1",
             "body.contains(document.activeElement)",
             "await refreshTaskPanel(true)",
