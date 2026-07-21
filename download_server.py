@@ -1091,6 +1091,21 @@ def renew_file(filename: str) -> float:
     return expires_at
 
 
+def renew_files(filenames: list[str]) -> int:
+    renewed_at = now_ts()
+    with META_LOCK:
+        meta = load_meta()
+        for filename in filenames:
+            path = DOWNLOADS_DIR / filename
+            if filename not in meta or not path.exists() or not path.is_file():
+                raise FileNotFoundError("部分文件不存在或已过期，请刷新后重试")
+        for filename in filenames:
+            meta[filename]["created_at"] = renewed_at
+        save_meta(meta)
+    append_log("renew.log", f"batch_renewed count={len(filenames)}")
+    return len(filenames)
+
+
 def delete_file(filename: str) -> None:
     path = safe_download_path(filename)
     path.unlink()
@@ -1952,6 +1967,7 @@ def page(title: str, body: str) -> bytes:
     .file-section, .task-panel { display: flex; flex-direction: column; height: 680px; min-width: 0; margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-bg); padding: 16px; box-shadow: none; }
     .task-panel { position: sticky; top: 16px; }
     #task-panel-body { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+    #file-panel-container { display: flex; flex: 1; flex-direction: column; min-height: 0; }
     .file-panel-body { display: flex; flex: 1; flex-direction: column; min-height: 0; }
     .file-list-scroll { flex: 1; min-height: 0; overflow-y: auto; }
     .section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -1962,6 +1978,7 @@ def page(title: str, body: str) -> bytes:
     .file-tool-button:hover, .file-tool-button[aria-expanded="true"] { background: var(--primary-dark); color: #fff; }
     .file-select-mode-toggle { min-width: 76px; height: 42px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
     .file-select-mode-toggle[aria-pressed="true"] { background: var(--primary); color: #fff; }
+    .file-select-mode-icon { width: 18px; height: 18px; flex: 0 0 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
     .task-list { flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--line); }
     .task-item { padding: 12px 0; border-bottom: 1px solid var(--line); }
     .task-primary { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
@@ -1989,6 +2006,7 @@ def page(title: str, body: str) -> bytes:
     .file-bulk-bar[hidden] { display: none; }
     .file-bulk-summary { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .file-selected-count { color: var(--text); font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .file-selected-size { color: var(--muted); font-weight: 650; }
     .file-bulk-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
     .file-bulk-actions button { min-width: 72px; padding: 7px 10px; font-size: 13px; }
     .file-bulk-actions button:disabled { opacity: .5; cursor: default; transform: none; }
@@ -2086,8 +2104,9 @@ def page(title: str, body: str) -> bytes:
       .file-sort { width: 100%; margin-left: 0; }
       .file-bulk-bar { align-items: stretch; flex-direction: column; }
       .file-bulk-summary { justify-content: space-between; }
-      .file-bulk-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .file-bulk-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .file-bulk-actions button { min-width: 0; }
+      .file-bulk-actions #batch-delete { grid-column: span 2; }
       .file-select-mode-toggle { min-width: 42px; width: 42px; padding: 0; }
       .file-select-mode-toggle .file-select-mode-text { display: none; }
       .admin-dashboard-grid { grid-template-columns: 1fr; }
@@ -2570,6 +2589,17 @@ def page(title: str, body: str) -> bytes:
       _filePage = 1;
       _applyFilters();
     }
+    function formatFileSize(size) {
+      var value = Math.max(0, Number(size) || 0);
+      var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      for (var i = 0; i < units.length; i++) {
+        if (value < 1024 || i === units.length - 1) {
+          return (i === 0 ? Math.round(value) : value.toFixed(1)) + ' ' + units[i];
+        }
+        value /= 1024;
+      }
+      return '0 B';
+    }
     function setFileSelectionMode(enabled) {
       _fileSelectionMode = !!enabled;
       var section = document.getElementById('available-files');
@@ -2607,7 +2637,12 @@ def page(title: str, body: str) -> bytes:
         pageSelect.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
       }
       var count = document.getElementById('batch-selected-count');
+      var size = document.getElementById('batch-selected-size');
+      var selectedSize = rows.reduce(function(total, row) {
+        return total + (_selectedFiles.has(row.dataset.filename || '') ? Number(row.dataset.size || 0) : 0);
+      }, 0);
       if (count) count.textContent = String(_selectedFiles.size);
+      if (size) size.textContent = formatFileSize(selectedSize);
       var actionButtons = document.querySelectorAll('[data-batch-file-action]');
       for (var actionIndex = 0; actionIndex < actionButtons.length; actionIndex++) {
         actionButtons[actionIndex].disabled = _selectedFiles.size === 0;
@@ -2707,6 +2742,21 @@ def page(title: str, body: str) -> bytes:
         requiresPassword: true,
         filenames: names
       }, button);
+    }
+    async function renewSelectedFiles() {
+      var names = Array.from(_selectedFiles);
+      if (!names.length) return;
+      var button = document.getElementById('batch-renew');
+      if (button) button.disabled = true;
+      try {
+        var payload = await postFormJson('/api/renew-files', {filenames: JSON.stringify(names)});
+        setFileSelectionMode(false);
+        await refreshFilePanel(true);
+        showToast(payload.message || '\u6240\u9009\u6587\u4ef6\u5df2\u7eed\u671f');
+      } catch (error) {
+        showToast(error.message || '\u6279\u91cf\u7eed\u671f\u5931\u8d25');
+        syncFileSelectionControls();
+      }
     }
     function closeFileMenus(exceptMenu) {
       var menus = document.querySelectorAll('.file-menu');
@@ -2894,7 +2944,7 @@ def page(title: str, body: str) -> bytes:
         if (selectionToggle) selectionToggle.disabled = payload.file_count === 0;
         if (payload.file_count === 0 && _fileSelectionMode) setFileSelectionMode(false);
         if (!force && payload.signature === _fileSignature) return;
-        if (container.contains(document.activeElement)) return;
+        if (!force && container.contains(document.activeElement)) return;
         container.innerHTML = payload.html;
         container.dataset.signature = payload.signature;
         _fileSignature = payload.signature;
@@ -3131,13 +3181,16 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         '<div class="file-bulk-summary">'
         '<label class="file-select-all"><input id="file-page-select" type="checkbox" '
         'onchange="toggleFilePageSelection(this.checked)"> <span>本页全选</span></label>'
-        '<span class="file-selected-count">已选 <span id="batch-selected-count">0</span> 个</span>'
+        '<span class="file-selected-count">已选 <span id="batch-selected-count">0</span> 个'
+        ' · <span id="batch-selected-size" class="file-selected-size">0 B</span></span>'
         '</div>'
         '<div class="file-bulk-actions">'
         '<button id="batch-download" class="secondary" type="button" data-batch-file-action disabled '
         'onclick="downloadSelectedFiles()">下载</button>'
         '<button id="batch-archive" class="secondary" type="button" data-batch-file-action disabled '
         'onclick="archiveSelectedFiles()">打包 ZIP</button>'
+        '<button id="batch-renew" class="secondary" type="button" data-batch-file-action disabled '
+        'onclick="renewSelectedFiles()">续期</button>'
         '<button id="batch-delete" class="danger" type="button" data-batch-file-action disabled '
         'onclick="deleteSelectedFiles(this)">删除</button>'
         '<button class="secondary" type="button" onclick="setFileSelectionMode(false)">取消</button>'
@@ -3187,6 +3240,7 @@ def render_file_rows(files: list[dict[str, object]], compact: bool = False) -> s
         rows.append(
             f'<tr class="file-row" data-type="{html.escape(ft, quote=True)}" '
             f'data-name="{safe_name_attr}" data-filename="{safe_name_attr}" data-index="{index}" '
+            f'data-size="{max(0, int(item.get("size", 0)))}" '
             f'data-created="{float(item.get("created_at", 0)):.6f}" data-expires="{float(item.get("expires_at", 0)):.6f}" '
             'onclick="toggleFileRow(event, this)">'
             '<td><div class="file-row-main">'
@@ -3601,7 +3655,12 @@ def render_home(message: str = "") -> bytes:
           <div class="file-tools" aria-label="文件工具">
             <button id="toggle-file-selection" class="file-select-mode-toggle secondary" type="button"
                     onclick="toggleFileSelectionMode()" aria-pressed="false" aria-label="多选文件" title="多选文件"{' disabled' if not files else ''}>
-              <span aria-hidden="true">✓</span><span id="file-select-mode-label" class="file-select-mode-text">多选</span>
+              <svg class="file-select-mode-icon" viewBox="0 0 20 20" aria-hidden="true">
+                <rect x="2.5" y="3" width="5" height="5" rx="1"></rect>
+                <rect x="2.5" y="12" width="5" height="5" rx="1"></rect>
+                <path d="M10.5 5.5h7M10.5 14.5h7"></path>
+              </svg>
+              <span id="file-select-mode-label" class="file-select-mode-text">多选</span>
             </button>
             <button id="open-add-task" class="file-tool-button" type="button" data-admin-modal="add-task-modal"
                     aria-controls="add-task-modal" aria-expanded="false" aria-label="添加链接" title="添加链接">
@@ -3999,6 +4058,8 @@ class DownloadHandler(BaseHTTPRequestHandler):
             self.handle_clear_stopped(form)
         elif raw_path == "/api/renew":
             self.handle_renew(form)
+        elif raw_path == "/api/renew-files":
+            self.handle_renew_files(form)
         elif raw_path == "/api/delete-file":
             self.handle_delete_file(form)
         elif raw_path == "/api/delete-files":
@@ -4148,6 +4209,25 @@ class DownloadHandler(BaseHTTPRequestHandler):
             "ok": True,
             "message": "续期成功",
             "remaining": format_remaining(expires_at),
+        })
+
+    def handle_renew_files(self, form: dict[str, str]) -> None:
+        try:
+            filenames = parse_batch_filenames(form.get("filenames", ""))
+            renewed = renew_files(filenames)
+        except FileNotFoundError as exc:
+            self.send_json(404, {"error": str(exc)})
+            return
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self.send_json(500, {"error": f"批量续期失败：{exc}"})
+            return
+        self.send_json(200, {
+            "ok": True,
+            "message": f"已续期 {renewed} 个文件",
+            "renewed": renewed,
         })
 
     def handle_delete_file(self, form: dict[str, str]) -> None:

@@ -806,6 +806,7 @@ class DownloadServerBehaviorTests(unittest.TestCase):
                 "name": "clip.mp4",
                 "url_name": "clip.mp4",
                 "file_type": "video",
+                "size": 12 * 1024 * 1024,
                 "size_human": "12 MiB",
                 "created_at_text": "2026-07-16 01:00",
                 "expires_at_text": "2026-07-17 01:00",
@@ -839,7 +840,10 @@ class DownloadServerBehaviorTests(unittest.TestCase):
         self.assertIn('id="file-page-select"', body)
         self.assertIn('id="batch-download"', body)
         self.assertIn('id="batch-archive"', body)
+        self.assertIn('id="batch-renew"', body)
         self.assertIn('id="batch-delete"', body)
+        self.assertIn('id="batch-selected-size"', body)
+        self.assertIn('data-size="12582912"', body)
         self.assertIn('id="file-bulk-bar" class="file-bulk-bar" hidden', body)
         self.assertNotIn('name="password"', body)
         self.assertIn('aria-expanded="false"', body)
@@ -1128,6 +1132,36 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_batch_renew_requires_no_password_and_updates_selected_files(self):
+        first = self.ds.DOWNLOADS_DIR / "renew-a.txt"
+        second = self.ds.DOWNLOADS_DIR / "renew-b.txt"
+        first.write_text("a", encoding="utf-8")
+        second.write_text("b", encoding="utf-8")
+        old_created_at = self.ds.now_ts() - 3600
+        self.ds.save_meta({
+            first.name: {"created_at": old_created_at, "retention_seconds": 86400.0},
+            second.name: {"created_at": old_created_at, "retention_seconds": 604800.0},
+        })
+        server, thread, base = self.start_test_server()
+        try:
+            status, payload = self.post_form_json(
+                base,
+                "/api/renew-files",
+                {"filenames": json.dumps([first.name, second.name])},
+            )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["renewed"], 2)
+            meta = self.ds.load_meta()
+            self.assertGreater(meta[first.name]["created_at"], old_created_at)
+            self.assertEqual(meta[first.name]["created_at"], meta[second.name]["created_at"])
+            self.assertEqual(meta[first.name]["retention_seconds"], 86400.0)
+            self.assertEqual(meta[second.name]["retention_seconds"], 604800.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_delete_file_api_requires_password_and_removes_file_metadata(self):
         target = self.ds.DOWNLOADS_DIR / "delete-me.txt"
         target.write_text("hello", encoding="utf-8")
@@ -1245,12 +1279,15 @@ class DownloadServerBehaviorTests(unittest.TestCase):
 
         self.assertIn('id="toggle-file-selection"', body)
         self.assertIn('aria-pressed="false"', body)
+        self.assertIn('class="file-select-mode-icon"', body)
+        self.assertNotIn('<span aria-hidden="true">✓</span>', body)
 
         for css_or_script in (
             ".workspace-columns",
             "minmax(0, 1.45fr)",
             "height: 680px",
             ".file-list-scroll",
+            "#file-panel-container { display: flex; flex: 1; flex-direction: column; min-height: 0; }",
             ".file-table tbody tr",
             "@media (max-width: 900px)",
             ".file-type-icon",
@@ -1301,11 +1338,14 @@ class DownloadServerBehaviorTests(unittest.TestCase):
             "id=\"disk-usage-bar\"",
             "function sortFiles",
             "function toggleFileSelectionMode",
+            "function formatFileSize",
             "function downloadSelectedFiles",
             "function archiveSelectedFiles",
+            "function renewSelectedFiles",
             "function deleteSelectedFiles",
             "toggleFilePageSelection",
             "'/api/archive-files'",
+            "'/api/renew-files'",
             "'/api/delete-files'",
             "if (resetPage) _taskPage = 1",
             "body.contains(document.activeElement)",
